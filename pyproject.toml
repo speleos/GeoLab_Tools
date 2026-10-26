@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "das-processor"
+version = "0.1.0"
+description = "Processing tools for Distributed Acoustic Sensing (DAS) data"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }          # change to your license
+authors = [{ name = "Your Name", email = "you@example.com" }]
+keywords = ["DAS", "distributed acoustic sensing", "seismology", "obspy"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy",
+    "scipy>=1.12",        # ShortTimeFFT was added in scipy 1.12
+    "pandas",
+    "matplotlib",
+    "h5py",
+    "obspy",
+    "sympy",
+    "tqdm",
+    "memory_profiler",
+    "julian",
+    "simpledas",
+    "xdas",
+]
+
+[project.optional-dependencies]
+notebook = ["ipywidgets"]   # only used when running inside Jupyter
+dev = ["pytest", "build", "twine"]
+
+[project.scripts]
+das-processor = "das_processor.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USER/YOUR_REPO"
+Issues = "https://github.com/YOUR_USER/YOUR_REPO/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+das_processor = ["templates/*.py"]
