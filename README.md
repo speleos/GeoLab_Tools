@@ -1,6 +1,6 @@
 # GeoLab tools
 Tools to automate the processing of OptoDAS datasets
-
+Copyright (C) 2026 Afonso Loureiro / ARDITI
 
 ## Usage
 
@@ -89,6 +89,13 @@ sources = {
     },
 }
 ```
+---
+## License & Attribution
+
+This project is licensed under the **GNU General Public License v3.0 or later (GPL-3.0-or-later)** - see the [LICENSE](LICENSE) file for details.
+
+* **Copyright © 2026 Afonso Loureiro / ARDITI** - Tools and Framework
+* **Portions Copyright © ASN** - Certain algorithms, modules, or foundational components are copyright **ASN** and used under the terms of the GNU General Public License (GPL-3.0-or-later).
 ---
 ## Funding
 This development was supported by the European Commission under the Horizon Europe programme, through the project SUBMERSE (https://submerse.eu/) (Grant Agreement No. 101095055), funded within the HORIZON-INFRA-2022-TECH-01 call.
