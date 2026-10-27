@@ -83,6 +83,20 @@ def setup_logging(log_dir=".", level=logging.INFO):
 #        filename=log_filename
 #    )
 
+def create_global_params(defaults, sources, exec_params):
+    """Constructs and returns the global configuration dictionary."""
+    return {
+        "freq_params": defaults.freq_params,
+        "exec_params": exec_params,
+        "path_params": defaults.path_params,
+        "trace_header": defaults.trace_header,
+        "channel_ranges": defaults.channel_ranges,
+        "offset_ranges": defaults.offset_ranges,
+        "sources": sources.sources,
+        "station_coordinates": defaults.station_coordinates,
+        "acquisition_params": defaults.acquisition_params,
+        "clock_offset": defaults.clock_offset,
+    }
 
 def process_events(events_to_process, global_params):
     setup_logging()
@@ -2450,6 +2464,7 @@ class DASProcessor:
         vmax = p.get("envelope_vmax", ep.get("envelope_vmax", 2))
 
         print(f"»»» Running envelope (Cmap: {cmap}, Vmin: {vmin}, Vmax: {vmax})")
+        logging.info(f"»»» Running envelope (Cmap: {cmap}, Vmin: {vmin}, Vmax: {vmax})")
         # 1. Attempt to extract the real part; if it's a Stream object, this will fail.
         try:
             data = self.dfdas.real
