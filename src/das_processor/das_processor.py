@@ -4,7 +4,6 @@ import os
 import numpy as np
 import warnings
 from collections.abc import Iterable
-from simpledas import h5pydict
 from sympy import symbols, sympify
 import re
 import simpledas
