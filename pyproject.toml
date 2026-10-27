@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 
 # Contains code derived from simpleDAS (GPL-3.0), so the package must be GPL.
 # If the simpleDAS file headers say "or later", you may use "GPL-3.0-or-later".
-license = "GPL-3.0-only"
+license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 
 authors = [{ name = "Afonso Loureiro", email = "afonso.loureiro@arditi.pt" }]
