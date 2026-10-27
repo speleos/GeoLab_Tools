@@ -80,38 +80,46 @@ trace_header={'5V':
 }
 
 channel_ranges={
-    "seismic": {"channel_min": [450] ,
-                "channel_max": [11293] ,
+    "seismic": {"channel_min":  [450] ,
+                "channel_max":  [11293] ,
                 "channel_step": [1]} ,
 
-    "seismic5": {"channel_min": [1000] ,
-                "channel_max": [11283] ,
-                "channel_step": [5]} ,
+    "seismic5": {"channel_min":  [1000] ,
+                 "channel_max":  [11283] ,
+                 "channel_step": [5]} ,
 
+    "seismic10": {"channel_min":  [1000] ,
+                  "channel_max":  [11283] ,
+                  "channel_step": [10]} ,
 
-    "seismic10": {"channel_min": [1000] ,
-                "channel_max": [11283] ,
-                "channel_step": [10]} ,
-
-    "internal_tides": {"channel_min": [500] ,
-                "channel_max": [11000] ,
-                "channel_step": [100]} ,
+    "cross_correlation": {"channel_min":  [3000] ,
+                          "channel_max":  [11000] ,
+                          "channel_step": [5]} ,
     
-    "coastal": {"channel_min": [450] ,
-                "channel_max": [2500] ,
+    "internal_tides": {"channel_min":  [500] ,
+                       "channel_max":  [11000] ,
+                       "channel_step": [100]} ,
+    
+    "mseed_A": {"channel_min":  [200] ,
+                "channel_max":  [4000] ,
+                "channel_step": [20]} ,
+    
+    "coastal": {"channel_min":  [450] ,
+                "channel_max":  [2500] ,
                 "channel_step": [1]} ,
     
-    "land": {"channel_min": [0] ,
-              "channel_max": [800] ,
-              "channel_step": [1]} ,
+    "land": {"channel_min":  [0] ,
+             "channel_max":  [800] ,
+             "channel_step": [1]} ,
     
-    "spectrogram": {"channel_min": [200,1200,2200,3200,4200,5200,6200,7200,8200,9200,10200,11200] ,
-                "channel_max":     [305,1205,2205,3205,4205,5205,6205,7205,8205,9205,10205,11205] ,
-                "channel_step":    [10 ,1   ,1   ,1   ,1   ,1   ,1   ,1   ,1   ,1   ,1    ,1    ]} ,
+    "spectrogram": {"channel_min":  [200,1200,2200,3200,4200,5200,6200,7200,8200,9200,10200,11200] , # channel ranges need not be contiguous
+                    "channel_max":  [305,1205,2205,3205,4205,5205,6205,7205,8205,9205,10205,11205] ,
+                    "channel_step": [10 ,1   ,1   ,1   ,1   ,1   ,1   ,1   ,1   ,1   ,1    ,1    ]} ,
 }
 
 offset_ranges={
-    "2.3-8km + 10-15km": {"offset_min": [2300,10000] ,
+    "2.3-8km + 10-15km":{
+           "offset_min": [2300,10000] ,
            "offset_max": [8000,15000] ,  
           "offset_step": [5   ,5    ]},
 }
