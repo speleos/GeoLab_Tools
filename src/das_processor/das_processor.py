@@ -6,7 +6,6 @@ import warnings
 from collections.abc import Iterable
 from sympy import symbols, sympify
 import re
-import simpledas
 import xdas as xd
 import builtins
 import string
