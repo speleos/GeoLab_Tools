@@ -7,9 +7,9 @@ Tools to automate the processing of OptoDAS datasets
 There are two configuration files:
 
 - *defaults.py*, where general parameters that modify function behaviour are defined.
-- *sources_list.py*, where the events and processing steps are defined
+- *sources.py*, where the events and processing steps are defined
 
-A commented example entry for *sources_list.py*:
+A commented example entry for *sources.py*:
 
 ```
 sources = {
@@ -89,19 +89,6 @@ sources = {
     },
 }
 ```
-The example script shows how to run two separate processing chains. The first will download example data from GEOFON. The second will automatically convert the data into MSEED in hourly files.
-
-
-
-## Dispersion curves fit
-The dispersion curves example needs a single 30-minute hdf5 file, downsampled to 1 Hz. The file can be assembled from the individual 10-seconds files and decimated using DAS_processor.
-
-## Baleen whale detector
-There is also a baleen whale detector based on template matching that can be run separately after data has been loaded and converted to Stream() using the dfdas_to_mseed function (even with write set to False).
-
-## Whale locator
-The script requires a 60-seconds Stream() of the entire cable, decimated to 100 Hz. The script can read a miniSEED file, or use DAS_processor to load raw DAS data, decimate it, and converted it to Stream().
-
 ---
 ## Funding
 This development was supported by the European Commission under the Horizon Europe programme, through the project SUBMERSE (https://submerse.eu/) (Grant Agreement No. 101095055), funded within the HORIZON-INFRA-2022-TECH-01 call.
