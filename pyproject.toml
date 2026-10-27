@@ -1,39 +1,41 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "das-processor"
 version = "0.1.0"
-description = "Processing tools for Distributed Acoustic Sensing (DAS) data"
+description = "Processing tools for Distributed Acoustic Sensing (DAS) data: MiniSEED export, StationXML, event plots, filtering and whale detection"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }          # change to your license
-authors = [{ name = "Your Name", email = "you@example.com" }]
-keywords = ["DAS", "distributed acoustic sensing", "seismology", "obspy"]
+
+# Contains code derived from simpleDAS (GPL-3.0), so the package must be GPL.
+# If the simpleDAS file headers say "or later", you may use "GPL-3.0-or-later".
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+
+authors = [{ name = "Afonso Loureiro", email = "afonso.loureiro@arditi.pt" }]
+keywords = ["DAS", "distributed acoustic sensing", "seismology", "obspy", "OptoDAS"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering",
 ]
+
 dependencies = [
     "numpy",
-    "scipy>=1.12",        # ShortTimeFFT was added in scipy 1.12
+    "scipy>=1.12",        # ShortTimeFFT is imported from scipy.signal (added in 1.12)
     "pandas",
     "matplotlib",
     "h5py",
     "obspy",
-    "sympy",
+    "sympy",              # unit handling in _combine_units
     "tqdm",
-    "memory_profiler",
-    "julian",
-    "simpledas",
-    "xdas",
 ]
 
 [project.optional-dependencies]
-notebook = ["ipywidgets"]   # only used when running inside Jupyter
+s3 = ["boto3"]              # only for get_data_from_S3
+notebook = ["ipywidgets"]   # tqdm.notebook progress bars inside Jupyter
 dev = ["pytest", "build", "twine"]
 
 [project.scripts]
@@ -45,6 +47,8 @@ Issues = "https://github.com/YOUR_USER/YOUR_REPO/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+namespaces = false
 
+# Ships the two configuration templates (defaults.py, sources.py) inside the wheel.
 [tool.setuptools.package-data]
 das_processor = ["templates/*.py"]
