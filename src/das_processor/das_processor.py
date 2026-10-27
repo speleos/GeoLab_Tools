@@ -105,8 +105,8 @@ def process_events(events_to_process, global_params):
                 print(f"{key}: {value}")
     logging.info('#############################')
 
-    # Validate that all sources reference valid channel ranges
-    validate_source_channel_ranges(global_params)
+    validate_source_channel_ranges(events_to_process, global_params)
+    validate_seismic_event_fields(events_to_process, global_params)
     
     print("######################")
     print('»»» Processing event windows.')
@@ -193,13 +193,16 @@ def process_events(events_to_process, global_params):
 
     return DAS
 
-def validate_source_channel_ranges(global_params: dict
+def validate_source_channel_ranges(
+    events_to_process: list[str], global_params: dict
 ) -> None:
     excluded_modes = {"time_lapse", "s3_download", "delete_data"}
     sources = global_params.get("sources", {})
     channel_ranges = global_params.get("channel_ranges", {})
 
-    for event in sources:
+    for event in events_to_process:
+        if event not in sources:
+            continue
         source = sources[event]
         event_mode = source.get("mode")
         if event_mode in excluded_modes:
@@ -210,6 +213,32 @@ def validate_source_channel_ranges(global_params: dict
             raise ValueError(
                 f"{event}: '{source_type}' does not exist in the defined channel_ranges."
             )
+
+
+def validate_seismic_event_fields(
+    events_to_process: list[str], global_params: dict
+) -> None:
+    """Require seismic source metadata only for selected seismic events."""
+    required_fields = ("magnitude", "latitude", "longitude", "depth", "local")
+    sources = global_params.get("sources", {})
+
+    for event in events_to_process:
+        source = sources.get(event)
+        if source is None or source.get("type") != "seismic":
+            continue
+
+        missing_fields = [
+            field
+            for field in required_fields
+            if source.get(field) is None
+            or (isinstance(source.get(field), str) and not source[field].strip())
+        ]
+        if missing_fields:
+            raise ValueError(
+                f"{event}: seismic events require "
+                f"{', '.join(missing_fields)}."
+            )
+
 
 class DictFile(File):
     """Read and write HDF5 files as nested Python dictionaries."""
@@ -1525,16 +1554,16 @@ class DASProcessor:
         Calculates figure size, start time, and duration for the event.
         Stores results in self.figsize, self.datetime_start, and self.duration.
         """
+
         ap = self.acquisition_params
         ep = self.exec_params
         einfo = self.event_info
         if station is None:
             station = ep.get("station")
 
-
         if self.roi_step is None:
             logging.warning("ROI step is not set. Attempting to retrieve from loaded data.")
-            self.roi_step= self.filemeta['demodSpec']['roiDec'][0]
+            self.roi_step = self.filemeta['demodSpec']['roiDec'][0]
             if self.roi_step is None:
                 logging.warning("ROI step could not be retrieved from current dfdas data. Attempting to retrieve from files.")
                 experiment_path = self.path_params.get("experiment_path")
@@ -1545,15 +1574,18 @@ class DASProcessor:
                 raise ValueError("ROI step is not set and could not be retrieved from files.")
 
         print(f'Processing event {event}, of the type {einfo.get("type")}')
+        logging.info(f'Processing event {event}, of the type {einfo.get("type")}')
         print('Calculating trim times and figure sizes...')
+        logging.info('Calculating trim times and figure sizes.')
 
         # Determine clock offset based on GPS status stored in the class
         if ap.get("gps_status"):
             clock_offset = 0
         else:
-            # Note: We assume clock_offset was passed into global_params 
-            # and stored in self at __init__
             clock_offset = ep.get("clock_offset", 0) 
+            if clock_offset == 0:
+                logging.warning("No GPS timing reported, but clock was not corrected.")
+                print(f"No GPS timing reported, but clock was not corrected.\nRevise 'clock_offset' parameter in defaults.py")
 
         # Logic for Seismic vs Other types
         if einfo.get("type", "").startswith('seismic'):
