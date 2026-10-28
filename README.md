@@ -202,21 +202,10 @@ exec_params = {
     "verbose": True,
 }
 
-global_params = {
-    "freq_params": freq_params,
-    "exec_params": exec_params,
-    "path_params": path_params,
-    "trace_header": trace_header,
-    "channel_ranges": channel_ranges,
-    "offset_ranges": offset_ranges,
-    "sources": sources,
-    "station_coordinates": station_coordinates,
-    "acquisition_params": acquisition_params,
-}
+global_params = create_global_params(defaults, sources, exec_params)
 
-results = process_events(events_to_process, global_params)
+DAS=process_events(events_to_process, global_params)
 
-DAS = results["STATIONXML_20260413"]
 print(DAS.dfdas.shape)        # (samples, channels)
 ```
 
@@ -228,7 +217,7 @@ What `process_events` does for every event in the list:
 4. Runs the event's `process_chain`, if it has one.
 5. Writes a log file for the event.
 
-`process_events` returns a dictionary `{event name: DASProcessor}`. The loaded data is in `results[event].dfdas`. Keep an eye on memory: all events stay in the dictionary until you delete them (`del results[event]`).
+`process_events` returns a DAS object with DAS.dfdas holding the DAS data.
 
 Run it with `python run.py`, or paste it into a notebook.
 
@@ -260,7 +249,7 @@ Cuts the interval `start_time` to `end_time` into windows of `window_duration` s
 },
 ```
 
-Data is released after each window, so `results[event].dfdas` is `None` for time-lapse events.
+Data is released after each window, so `DAS.dfdas` is `None` for time-lapse events.
 
 ### `s3_download`: fetch raw files from S3
 
@@ -274,7 +263,7 @@ Needs the `s3` extra (`boto3`). Downloads the files covering `start_time` to `en
     "unsigned": True,                 # anonymous access
     "start_time": "2026-04-13T00:00:00",
     "end_time": "2026-04-13T01:00:00",
-    "DAS_data_path": "/mnt/DOMLUIZ/DATA_dphi",
+    "DAS_data_path": "/mnt/DATA_dphi",
 },
 ```
 
@@ -287,15 +276,14 @@ The process chain is a convenience. Everything it does is a normal method call, 
 Define the event in `sources.py` **without** a `process_chain` (it still provides the time window, channels and paths), then work on the result:
 
 ```python
-results = process_events(["STATIONXML_20260413"], global_params)
-DAS = results["STATIONXML_20260413"]
+DAS = process_events(["STATIONXML_20260413"], global_params)
 
 DAS.dfdas                              # DASDataFrame: rows = time samples, columns = channels
 DAS.dfdas.meta                         # metadata, e.g. meta["dt"] (sample interval) and meta["time"]
 
-DAS.decimate_dfdas(factors=[2])        # same as the "decimate_dfdas" step
+DAS.decimate_dfdas(factors=[2])        # same as the "decimate_dfdas" step. Replaces DAS.dfdas with the decimated data
 DAS.plot_seismic_section(channel_step=10, max_time_s=30)
-DAS.dfdas_to_mseed("STATIONXML_20260413", write="channels")
+DAS.dfdas_to_mseed("STATIONXML_20260413", write="channels") # populated DAS.mseed and writes each trace as individual channels
 ```
 
 You see the data between steps, repeat a step with other arguments, or stop after any step. The arguments are exactly the `params` you would put in a chain.
@@ -355,12 +343,13 @@ filtered = pd.DataFrame(
 rms_per_channel = filtered.pow(2).mean().pow(0.5)
 ```
 
-To reuse the package's own steps on this data, attach it to a processor. Steps that only need the data and its metadata, such as decimation, then work directly:
+To reuse the package's own steps on this data, attach it to a processor. Steps that only need the data and its metadata, such as decimation or FK-filtering, then work directly:
 
 ```python
 DAS = DASProcessor(global_params)
 DAS.dfdas = dfdas
 DAS.decimate_dfdas(factors=[2])
+DAS.fkfilter(vmin=1400,vmax=99999))
 ```
 
 Steps that need event information (station coordinates, travel times, MiniSEED/StationXML headers, plots with phases) also need `DAS.event_info`, `DAS.filemeta`, `DAS.datetime_start`, `DAS.duration` and `DAS.channels`. For those, use approach A.
