@@ -124,7 +124,8 @@ sources = {
 | `start_time` | Reference time, ISO format. For `type: "seismic"` this is the earthquake origin time; for any other type it is the start of the window |
 | `type` | `"seismic"` computes the P arrival with TauP at the reference station (needs `magnitude`, `latitude`, `longitude`, `depth`) and cuts the window around it. Any other value cuts `start_time - window_in` directly |
 | `window_in` | Seconds to include **before** the P arrival (seismic) or before `start_time` (other types) |
-| `window_duration` | Seconds to include after that point. Total length is `window_in + window_duration` |
+| `window_duration` | Seconds to include after that point. Total length is `window_in + window_duration`. For `type: "time_lapse"` it is the duration of each temporal slice, and processing is repeated until `end_time` is reached |
+| `end_time` | Reference time, ISO format. For `type: "time_lapse"` this marks the time of the last slice of length `window_duration` to be processed |
 | `GPS` | `True` if the interrogator clock was GPS-locked. If `False`, `clock_offset` is applied to the start time |
 | `channel_ranges` | Name of an entry in `channel_ranges` in `defaults.py`. Validated at start-up: unknown names raise an error |
 | `DAS_data_path` | Folder with the raw files (sub-folders named `YYYYMMDD`). Overrides `path_params["experiment_path"]` for this event only |
@@ -249,8 +250,8 @@ Cuts the interval `start_time` to `end_time` into windows of `window_duration` s
     "window_duration": 30,
     "window_in": 0,
     "type": "seismic", "GPS": True,
-    "channel_ranges": "mseed_IRIS_ALL",
-    "DAS_data_path": "/mnt/DOMLUIZ/DATA_dphi",
+    "channel_ranges": "mseed_A",
+    "DAS_data_path": "/mnt/DATA_dphi",
     "mseed_output_path": "/tmp/mseed",
     "process_chain": [
         {"operation": "decimate_dfdas", "params": {"factors": [2]}},
@@ -325,7 +326,7 @@ from das_processor import find_DAS_files, load_DAS_files
 
 # 1. Locate the files overlapping a time window.
 files, chIndex, samples = find_DAS_files(
-    "/mnt/DOMLUIZ/DATA_dphi",                      # folder with YYYYMMDD sub-folders
+    "/mnt/DATA_dphi",                      # folder with YYYYMMDD sub-folders
     start=datetime.datetime(2026, 4, 13, 0, 0, 0),
     duration=datetime.timedelta(seconds=30),
     channels=np.arange(2000, 8000, 50),            # channel numbers as in the file header
@@ -370,11 +371,7 @@ These do not need a processor or an event, and can be imported from `das_process
 
 | Function | Purpose |
 |---|---|
-| `get_data_indexes(path)`, `get_filemeta(path, metaDetail)` | Read channel/sample indexes and header metadata of one HDF5 file |
 | `save_to_DAS_file(dfdas, filepath)` | Write a `DASDataFrame` to an HDF5 file |
-| `get_travel_times(event, global_params, rec_lat, rec_lon)` | TauP P and S arrivals for an event defined in `sources` |
-| `zerophase_chebyshev_lowpass_filter(trace, freqmax)` | Zero-phase Chebyshev II low-pass on an ObsPy trace |
-| `degrade_coordinates(lat, lon, precision, error_metres)` | Blur coordinates for public data release |
 | `baleen_whale_detector(st, global_params, ...)` | Fin-whale call detector on an ObsPy `Stream` |
 
 ## Output files and logs
@@ -400,6 +397,9 @@ These do not need a processor or an event, and can be imported from `das_process
 
 ## License and credits
 
-Released under the GNU General Public License v3.0 (see `LICENSE`).
+Released under the GNU General Public License v3.0 (see [LICENSE](LICENSE)).
 
 The DAS file reading code is derived from [simpleDAS](https://github.com/ASN-Norway/simpleDAS) by ASN (GPL-3.0). The package also builds on [ObsPy](https://docs.obspy.org/), NumPy, SciPy, pandas and Matplotlib.
+
+## Funding
+This development was supported by the European Commission under the Horizon Europe programme, through the project SUBMERSE (https://submerse.eu/) (Grant Agreement No. 101095055), funded within the HORIZON-INFRA-2022-TECH-01 call.
