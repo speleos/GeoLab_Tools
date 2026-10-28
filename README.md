@@ -127,11 +127,12 @@ sources = {
 | `window_duration` | Seconds to include after that point. Total length is `window_in + window_duration`. For `type: "time_lapse"` it is the duration of each temporal slice, and processing is repeated until `end_time` is reached |
 | `end_time` | Reference time, ISO format. For `type: "time_lapse"` this marks the time of the last slice of length `window_duration` to be processed |
 | `GPS` | `True` if the interrogator clock was GPS-locked. If `False`, `clock_offset` is applied to the start time |
+| `local` | `True` Defines if an earthquake is local or not. For `type: "seismic"` this changes plotting parameters |
 | `channel_ranges` | Name of an entry in `channel_ranges` in `defaults.py`. Validated at start-up: unknown names raise an error |
 | `DAS_data_path` | Folder with the raw files (sub-folders named `YYYYMMDD`). Overrides `path_params["experiment_path"]` for this event only |
 | `mseed_output_path` | Overrides `path_params["MSEED_path"]` for this event |
 | `events_path` | Overrides `path_params["events_path"]` (where the cut event HDF5 is cached) |
-| `save_DAS_event` | `True`/`False` overrides `exec_params["save_DFDAS"]` for this event |
+| `save_DAS_event` | `True`/`False` overrides `exec_params["save_DFDAS"]` for this event, but does not overwrite existing files |
 | `mode` | Optional. See [Other event modes](#other-event-modes). Leave out for a normal event |
 | `process_chain` | Optional list of processing steps (below) |
 
