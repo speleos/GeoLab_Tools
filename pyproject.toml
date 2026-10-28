@@ -32,10 +32,10 @@ dependencies = [
     "sympy",              # unit handling in _combine_units
     "tqdm",
     "boto3",
+    "ipywidgets",
 ]
 
 [project.optional-dependencies]
-notebook = ["ipywidgets"]   # tqdm.notebook progress bars inside Jupyter
 dev = ["pytest", "build", "twine"]
 
 [project.scripts]
