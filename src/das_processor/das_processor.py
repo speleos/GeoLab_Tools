@@ -22,7 +22,7 @@ from obspy.taup import TauPyModel
 from obspy import UTCDateTime, read, Trace, Stream
 #from obspy.io.segy.segy import SUFile,SEGYTraceHeader, SEGYBinaryFileHeader
 #from obspy.io.segy.core import _read_segy
-from obspy.geodetics import degrees2kilometers,locations2degrees
+from obspy.geodetics import degrees2kilometers,locations2degrees,gps2dist_azimuth
 from obspy.core.inventory import Inventory, Network, Station, Channel, Site,  Response, Equipment, Operator
 from obspy.core.inventory import InstrumentSensitivity, Person, PolesZerosResponseStage, CoefficientsTypeResponseStage
 
@@ -93,7 +93,7 @@ def create_global_params(defaults, sources, exec_params):
         "channel_ranges": defaults.channel_ranges,
         "offset_ranges": defaults.offset_ranges,
         "sources": sources.sources,
-        "station_coordinates": defaults.station_coordinates,
+        "station_coordinates": defaults.station_coordinates.get(exec_params["station"]),
         "acquisition_params": defaults.acquisition_params,
         "clock_offset": defaults.clock_offset,
     }
@@ -233,7 +233,7 @@ def validate_seismic_event_fields(
     events_to_process: list[str], global_params: dict
 ) -> None:
     """Require seismic source metadata only for selected seismic events."""
-    required_fields = ("magnitude", "latitude", "longitude", "depth", "local")
+    required_fields = ("magnitude", "latitude", "longitude", "depth")
     sources = global_params.get("sources", {})
 
     for event in events_to_process:
@@ -2237,7 +2237,6 @@ class DASProcessor:
         plt.tight_layout()
         plt.show()
     
-    
     def decimate_st(self):
         ep, fp, sp = self.exec_params , self.freq_params, self.stationxml_params
 
@@ -3098,7 +3097,7 @@ class DASProcessor:
 
         return st
 
-    def fk_filter(self, fs, vmin=1400,vmax=99999):
+    def fk_filter(self, vmin=1400,vmax=99999):
         """
         Apply FK filter to the data
         """
@@ -3153,7 +3152,6 @@ class DASProcessor:
 
         return self.mseed_stream
 
-
     def plot_record_sections(self, dataset=None, event=None, suffix=""):
         # Use class attributes for configuration to integrate with DASProcessor
         ep, pp, fp = self.exec_params, self.path_params, self.freq_params
@@ -3169,8 +3167,17 @@ class DASProcessor:
                                       f'{str(event)}_map.ps'],
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     
-        filename=f'{pp.get("figures_path")}/OptoDAS_{event}_record-section'
+        filename=f'{pp.get("figures_path")}/{event}_record-section{f"_{suffix}" if suffix else ""}'
     
+        dist_az_baz=gps2dist_azimuth(event_info['latitude'],event_info['longitude'],
+                                     self.station_coordinates["latitude"],self.station_coordinates["longitude"])
+        if dist_az_baz[0]<100000:
+            local = True
+            logging.info("Distance to event is less than 100 km. Considering it a local event for plotting.")
+        else:
+            local = False
+            logging.info("Distance to event is greater than 100 km. Considering it a regional/teleseismic event.")
+
         if ep.get("verbose"):
             # Print the standard output and standard error
             print("Standard Output:")
@@ -3200,7 +3207,7 @@ class DASProcessor:
         i91 = TauPyModel(model="iasp91")
     
         #filtering according to distance
-        if event_info.get("local"):
+        if local:
             max_freq=30
             min_freq=.5
         else:
@@ -3286,7 +3293,7 @@ class DASProcessor:
         # Create a new Stream object containing only every other trace
         every_other_trace = []
     
-        if event_info.get("local"):
+        if local:
             decim=400 #2000 #4000 #2000
         else:
             decim=100
@@ -3396,7 +3403,7 @@ class DASProcessor:
                     ax1[idx].set_title(f'{event_channel.stats.station}-{event_channel.stats.channel}')
                 ax1[idx].set_ylim(time_delta,0)
             
-            label_space = 1 if self.sources.get(event, {}).get("local") else 10
+            label_space = 1 if local else 10
             prev=0
             unique_phases=[]
             if not ep.get("plot_land_station"):
@@ -3464,9 +3471,9 @@ class DASProcessor:
         # ax3.set_ylim(time_delta-0.0001,0)
         prev=0
         annot=""
-        label_space = 1 if self.sources.get(event, {}).get("local") else 10
+        label_space = 1 if local else 10
         if ep.get("verbose"): 
-            print("LABEL SPACE:",self.sources.get(event, {}).get("local"),label_space)
+            print("LABEL SPACE:",local,label_space)
     
         for name, data in offset_traveltime_arrival.items():
             x=[point[0] for point in data]
