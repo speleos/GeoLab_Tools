@@ -28,15 +28,15 @@ pip install git+https://github.com/YOUR_USER/YOUR_REPO.git
 Optional extras:
 
 ```bash
-pip install "das-processor[s3] @ git+https://github.com/YOUR_USER/YOUR_REPO.git"        # S3 downloads (boto3)
-pip install "das-processor[notebook] @ git+https://github.com/YOUR_USER/YOUR_REPO.git"  # progress bars in Jupyter
+pip install "das-processor[s3] @ git+https://github.com/speleos/GeoLab_Tools.git"        # S3 downloads (boto3)
+pip install "das-processor[notebook] @ git+https://github.com/speleos/GeoLab_Tools.git"  # progress bars in Jupyter
 ```
 
 For development:
 
 ```bash
-git clone https://github.com/YOUR_USER/YOUR_REPO.git
-cd YOUR_REPO
+git clone https://github.com/speleos/GeoLab_Tools.git
+cd GeoLab_Tools
 pip install -e ".[dev]"
 ```
 
