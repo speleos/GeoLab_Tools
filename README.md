@@ -386,7 +386,9 @@ These do not need a processor or an event, and can be imported from `das_process
 
 ## License and credits
 
-Released under the GNU General Public License v3.0 (see [LICENSE](LICENSE)).
+**Copyright © 2026 Afonso Loureiro / ARDITI** - Tools and Framework
+
+This project is licensed under the **GNU General Public License v3.0 or later (GPL-3.0-or-later)** - see the [LICENSE](LICENSE) file for details.
 
 The DAS file reading code is derived from [simpleDAS](https://github.com/ASN-Norway/simpleDAS) by ASN (GPL-3.0). The package also builds on [ObsPy](https://docs.obspy.org/), NumPy, SciPy, pandas and Matplotlib.
 
