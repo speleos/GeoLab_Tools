@@ -178,13 +178,12 @@ Save as `run.py` in the folder that contains `defaults.py` and `sources.py`:
 
 ```python
 from das_processor import *
+init_config()                 # if the sources.py and defailts.py files are missing, it will create them 
 
-from sources import sources
-from defaults import (channel_ranges, offset_ranges, freq_params,
-                      path_params, trace_header, station_coordinates,
-                      clock_offset, acquisition_params)
+import sources
+import defaults
 
-events_to_process = ["STATIONXML_20260413"]
+events_to_process = ["EQ_20260413"]
 
 exec_params = {
     "events_to_process": events_to_process,
