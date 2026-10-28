@@ -93,7 +93,7 @@ def create_global_params(defaults, sources, exec_params):
         "channel_ranges": defaults.channel_ranges,
         "offset_ranges": defaults.offset_ranges,
         "sources": sources.sources,
-        "station_coordinates": defaults.station_coordinates.get(exec_params["station"]),
+        "station_coordinates": defaults.station_coordinates,
         "acquisition_params": defaults.acquisition_params,
         "clock_offset": defaults.clock_offset,
     }
@@ -1206,6 +1206,7 @@ class DASProcessor:
         self.acquisition_params = global_params.get('acquisition_params', {})
         self.trace_header = global_params.get('trace_header', {})
         self.freq_params = global_params.get('freq_params', {})
+        self.clock_offset = global_params.get('clock_offset',0)
 
         self.stationxml_params={
                                 "input_sampling_rate": [],
@@ -1594,10 +1595,9 @@ class DASProcessor:
 
         # Determine clock offset based on GPS status stored in the class
         if ap.get("gps_status"):
-            clock_offset = 0
+            self.clock_offset = 0
         else:
-            clock_offset = ep.get("clock_offset", 0) 
-            if clock_offset == 0:
+            if self.clock_offset == 0:
                 logging.warning("No GPS timing reported, but clock was not corrected.")
                 print(f"No GPS timing reported, but clock was not corrected.\nRevise 'clock_offset' parameter in defaults.py")
 
@@ -1614,8 +1614,8 @@ class DASProcessor:
             
             # Calculate start time with offset
             base_time = UTCDateTime(einfo.get("start_time"))
-            trim_time = base_time + arrivals_p[0].time - einfo.get("window_in") + datetime.timedelta(seconds=clock_offset)
-            print(f'Time offset correction of {clock_offset}s applied.')
+            trim_time = base_time + arrivals_p[0].time - einfo.get("window_in") + datetime.timedelta(seconds=self.clock_offset)
+            print(f'Time offset correction of {self.clock_offset}s applied.')
         else:
             self.figsize = (10, 8)
             trim_time = UTCDateTime(einfo.get("start_time")) - einfo.get("window_in")
@@ -2069,7 +2069,7 @@ class DASProcessor:
         if decimate:
             self.mseed_stream=self.decimate_st(self.mseed_stream,self.get_current_params())
 
-        if ep.get("stationXML") or stationXML:
+        if stationXML:
             if ep.get("verbose"):
                 print("Creating StationXML file for the current stream.")
                 station_xml_creation(self.mseed_stream,self.get_current_params())   
@@ -3158,6 +3158,7 @@ class DASProcessor:
         station_coordinates = self.station_coordinates
 
         event_info = self.sources.get(event, {})
+        station=ep["station"]
     
         print("Plotting record section.")
         result=subprocess.run(["bash","./plot_GMTmap.sh",
@@ -3170,7 +3171,8 @@ class DASProcessor:
         filename=f'{pp.get("figures_path")}/{event}_record-section{f"_{suffix}" if suffix else ""}'
     
         dist_az_baz=gps2dist_azimuth(event_info['latitude'],event_info['longitude'],
-                                     self.station_coordinates["latitude"],self.station_coordinates["longitude"])
+                                     self.station_coordinates.get(station)["latitude"],
+                                     self.station_coordinates.get(station)["longitude"])
         if dist_az_baz[0]<100000:
             local = True
             logging.info("Distance to event is less than 100 km. Considering it a local event for plotting.")
@@ -3231,19 +3233,17 @@ class DASProcessor:
                                                   source_longitude_in_deg=source_longitude,phase_list=('p','sP','s','P','PP','S','SS','SKS'), ray_param_tol=0.1)
         
         # calculate trim points    
-        time_delta=event_info.get("window_in")+event_info.get("end_time")-event_info.get("start_time")
+        time_delta=event_info["window_in"]+(UTCDateTime(event_info["end_time"])-UTCDateTime(event_info["start_time"]))
         
-        pdiff_time=UTCDateTime(event_info.get("time"))+arrivals_p[0].time
+        pdiff_time=UTCDateTime(event_info.get("start_time"))+arrivals_p[0].time
         start_trim_time=pdiff_time-datetime.timedelta(seconds=event_info.get("window_in"))
         end_trim_time=start_trim_time+datetime.timedelta(seconds=time_delta)
     
         date_format = DateFormatter("%d-%m-%Y %H:%M:%S")
     
-    
-    
         # Reference offset relative to event origin time
         p_time = arrivals_p[0].time - event_info.get('window_in')
-        event_time = UTCDateTime(event_info.get('time'))
+        event_time = UTCDateTime(event_info.get('start_time'))
     
         for arr in arrivals_p:
             # Keep time as float offset (seconds)
@@ -3268,7 +3268,7 @@ class DASProcessor:
             if hasattr(self, 'mseed_stream') and self.mseed_stream is not None:
                 st = self.mseed_stream
             elif self.dfdas is not None:
-                st = self.dfdas_to_mseed(event, write=False, decimate=ep.get("decimate_obspy"))
+                st = self.dfdas_to_mseed(event, write=False)
         elif isinstance(dataset, Stream):
             st = dataset
         else:
@@ -3276,7 +3276,7 @@ class DASProcessor:
             orig_dfdas = getattr(self, 'dfdas', None)
             self.dfdas = dataset
             restore_dfdas = True
-            st = self.dfdas_to_mseed(event, write=False, decimate=ep.get("decimate_obspy"))
+            st = self.dfdas_to_mseed(event, write=False)
 
         if restore_dfdas:
             self.dfdas = orig_dfdas
@@ -3437,8 +3437,9 @@ class DASProcessor:
                                                 source_longitude_in_deg=source_longitude,
                                                 phase_list=('p','sP','s','P','PP','S','SS','SKS'),
                                                 ray_param_tol=0.1)
-    
-            pdiff_time=UTCDateTime(event_info.get("start_time"))+arrivals[0].time+datetime.timedelta(seconds=ep.get("clock_offset"))
+
+            print(event_info["start_time"],arrivals[0],self.clock_offset)
+            pdiff_time=UTCDateTime(event_info.get("start_time"))+arrivals[0].time+datetime.timedelta(seconds=self.clock_offset)
             start_trim_time=pdiff_time-datetime.timedelta(seconds=event_info.get("window_in"))
         
             p_time=arrivals[0].time-event_info.get("window_in")
