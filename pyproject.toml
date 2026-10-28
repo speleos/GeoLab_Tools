@@ -31,10 +31,10 @@ dependencies = [
     "obspy",
     "sympy",              # unit handling in _combine_units
     "tqdm",
+    "boto3",
 ]
 
 [project.optional-dependencies]
-s3 = ["boto3"]              # only for get_data_from_S3
 notebook = ["ipywidgets"]   # tqdm.notebook progress bars inside Jupyter
 dev = ["pytest", "build", "twine"]
 
@@ -42,8 +42,8 @@ dev = ["pytest", "build", "twine"]
 das-processor = "das_processor.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/YOUR_USER/YOUR_REPO"
-Issues = "https://github.com/YOUR_USER/YOUR_REPO/issues"
+Homepage = "https://github.com/speleos/GeoLab_Tools"
+Issues = "https://github.com/speleos/GeoLab_Tools/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
