@@ -24,6 +24,7 @@ from .config import init_config, load_config
 _LAZY = {name: ".das_processor" for name in (
     # entry point and validation
     "process_events",
+    "create_global_params",
     "validate_source_channel_ranges",
     # main class
     "DASProcessor",
