@@ -15,7 +15,7 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("das-processor")
 except PackageNotFoundError:  # running from a source tree without installing
-    __version__ = "0.0.0"
+    __version__ = "0.1.0"
 
 from .config import init_config, load_config
 
