@@ -98,7 +98,7 @@ def create_global_params(defaults, sources, exec_params):
         "clock_offset": defaults.clock_offset,
     }
 
-def validate_sources(sources: dict) -> dict:
+def validate_sources(sources) -> dict:
     """
     Validates a dictionary of source configurations against defined rules:
     1. Must have 'start_time' and either 'window_duration' or 'end_time'.
@@ -110,15 +110,9 @@ def validate_sources(sources: dict) -> dict:
     """
     validation_errors = {}
 
-    for name, config in sources.items():
+    for name, config in sources.sources.items():
         errors = []
         
-        # Requirement 4: All entries must have 'type' and 'mode'
-        if "type" not in config:
-            errors.append("Missing required field: 'type'")
-        if "mode" not in config:
-            errors.append("Missing required field: 'mode'")
-            
         # Requirement 1: Each entry must have 'start_time' and either 'window_duration' or 'end_time'
         if "start_time" not in config:
             errors.append("Missing required field: 'start_time'")
@@ -134,12 +128,19 @@ def validate_sources(sources: dict) -> dict:
                 if field not in config:
                     errors.append(f"Seismic entry missing required field: '{field}'")
                     
-        # Requirement 3: All entries except 's3_download' and 'data_delete' must have 'channel_ranges'
+        # Requirement 3: All entries except 's3_download' and 'data_delete' must have 'channel_ranges' and 'type'
         if config.get("mode") not in ("s3_download", "data_delete"):
+            if "type" not in config:
+                errors.append("Missing required field: 'type'")
             if "channel_ranges" not in config:
                 errors.append("Missing required field: 'channel_ranges'")
+        
+        # Requirement 4: All entries must have 'mode'
+        if "mode" not in config:
+            errors.append("Missing required field: 'mode'")
                 
-        validation_errors[name] = errors
+        if len(errors) != 0:
+            validation_errors[name] = errors
 
     return validation_errors
 
