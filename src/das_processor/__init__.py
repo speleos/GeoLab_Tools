@@ -15,7 +15,7 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("das-processor")
 except PackageNotFoundError:  # running from a source tree without installing
-    __version__ = "0.1.0"
+    __version__ = "0.2.0"
 
 from .config import init_config, load_config
 
@@ -26,6 +26,7 @@ _LAZY = {name: ".das_processor" for name in (
     "process_events",
     "create_global_params",
     "validate_source_channel_ranges",
+    "validate_sources",
     # main class
     "DASProcessor",
     # DAS file reading/writing (simpleDAS-derived)
