@@ -238,6 +238,7 @@ def validate_source_channel_ranges(
                 f"{event}: '{source_type}' does not exist in the defined channel_ranges."
             )
 
+
 def validate_seismic_event_fields(
     events_to_process: list[str], global_params: dict
 ) -> None:
