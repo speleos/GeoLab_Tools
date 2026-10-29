@@ -98,6 +98,51 @@ def create_global_params(defaults, sources, exec_params):
         "clock_offset": defaults.clock_offset,
     }
 
+def validate_sources(sources: dict) -> dict:
+    """
+    Validates a dictionary of source configurations against defined rules:
+    1. Must have 'start_time' and either 'window_duration' or 'end_time'.
+    2. Entries with type 'seismic' must have 'magnitude', 'latitude', 'longitude', and 'depth'.
+    3. All entries except 's3_download' and 'data_delete' mode must have 'channel_ranges'.
+    4. All entries must have 'type' and 'mode'.
+    
+    Returns a dictionary of error messages for each entry.
+    """
+    validation_errors = {}
+
+    for name, config in sources.items():
+        errors = []
+        
+        # Requirement 4: All entries must have 'type' and 'mode'
+        if "type" not in config:
+            errors.append("Missing required field: 'type'")
+        if "mode" not in config:
+            errors.append("Missing required field: 'mode'")
+            
+        # Requirement 1: Each entry must have 'start_time' and either 'window_duration' or 'end_time'
+        if "start_time" not in config:
+            errors.append("Missing required field: 'start_time'")
+        
+        has_window = "window_duration" in config
+        has_end = "end_time" in config
+        if not (has_window or has_end):
+            errors.append("Must have either 'window_duration' or 'end_time'")
+            
+        # Requirement 2: Entries of type 'seismic' must have magnitude, latitude, longitude, and depth
+        if config.get("type") == "seismic":
+            for field in ["magnitude", "latitude", "longitude", "depth"]:
+                if field not in config:
+                    errors.append(f"Seismic entry missing required field: '{field}'")
+                    
+        # Requirement 3: All entries except 's3_download' and 'data_delete' must have 'channel_ranges'
+        if config.get("mode") not in ("s3_download", "data_delete"):
+            if "channel_ranges" not in config:
+                errors.append("Missing required field: 'channel_ranges'")
+                
+        validation_errors[name] = errors
+
+    return validation_errors
+
 def process_events(events_to_process, global_params):
     setup_logging()
     import time
@@ -1586,6 +1631,14 @@ class DASProcessor:
         if station is None:
             station = ep.get("station")
 
+        if einfo.get("window_duration") is None:
+            end_time = einfo.get("end_time")
+            start_time = einfo.get("start_time")
+            einfo["window_duration"] = (end_time - start_time).total_seconds()
+            logging.warning(f"`window_duration` was not set for {event}. Calculated from `start_time` and `end_time`.")
+            if ep.get("verbose"):
+                print(f"`window_duration` was not set for {event}. Calculated from `start_time` and `end_time`.")
+
         if self.roi_step is None:
             logging.warning("ROI step is not set. Attempting to retrieve from loaded data.")
             self.roi_step = self.filemeta['demodSpec']['roiDec'][0]
@@ -1642,7 +1695,6 @@ class DASProcessor:
         """
         Trims the DAS data to the specified time window.
         """
-
         window_in = pd.to_timedelta(self.event_info.get("window_in"), unit='s')
         window_duration = pd.to_timedelta(self.event_info.get("window_duration"), unit='s')
         start_time = pd.to_datetime(self.event_info.get("start_time"))
