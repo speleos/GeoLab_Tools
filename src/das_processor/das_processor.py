@@ -121,6 +121,13 @@ def process_events(events_to_process, global_params):
 
     validate_source_channel_ranges(events_to_process, global_params)
     validate_seismic_event_fields(events_to_process, global_params)
+
+    if not any(event in sources for event in events_to_process):
+        logging.error("List of events to process did not match any event in sources.py.")
+        logging.info("Nothing to do in `process_events`")
+        print(f"List of events to process ({events_to_process}) did not match any event in sources.py.")
+        print("Nothing to process.")
+        return None
     
     print("######################")
     print('»»» Processing event windows.')
@@ -205,6 +212,9 @@ def process_events(events_to_process, global_params):
         else:
             print(f"Loaded data for {event} was returned.")
 
+    if "DAS" not in locals() or DAS is None:
+        print("No data loaded.")
+        logging.warning("No data loaded.")
     return DAS
 
 def validate_source_channel_ranges(
@@ -227,7 +237,6 @@ def validate_source_channel_ranges(
             raise ValueError(
                 f"{event}: '{source_type}' does not exist in the defined channel_ranges."
             )
-
 
 def validate_seismic_event_fields(
     events_to_process: list[str], global_params: dict
