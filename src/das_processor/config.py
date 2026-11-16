@@ -65,6 +65,52 @@ def load_module(path, name):
     spec.loader.exec_module(module)
     return module
 
+def init_whale_templates(dest="whale_templates", prefixes=None, overwrite=False):
+    """Copy whale template files into ``dest``, optionally filtered by prefix.
+
+    Parameters
+    ----------
+    dest : str or Path
+        Target folder (created if needed). Default: ./whale_templates.
+    prefixes : str or iterable of str, optional
+        Only copy templates whose filename starts with one of these prefixes
+        (case-insensitive), e.g. ``"FIN"`` or ``["FIN", "BLUE"]``.
+        Default: copy all templates.
+    overwrite : bool
+        Replace files that already exist.
+
+    Returns
+    -------
+    list[Path]
+        Paths of the files that were created.
+    """
+    if isinstance(prefixes, str):
+        prefixes = (prefixes,)
+    if prefixes is not None:
+        prefixes = tuple(p.upper() for p in prefixes)
+
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    template_dir = files(__package__).joinpath("templates", "whale_templates")
+
+    created = []
+    for item in template_dir.iterdir():
+        if not item.is_file() or not item.name.endswith(".txt"):
+            continue
+        if prefixes is not None and not item.name.upper().startswith(prefixes):
+            continue
+        target = dest / item.name
+        if target.exists() and not overwrite:
+            print(f"Skipping {target} (already exists)")
+            continue
+        target.write_bytes(item.read_bytes())
+        print(f"Created {target}")
+        created.append(target)
+
+    if prefixes is not None and not created:
+        print(f"No templates found matching prefixes {prefixes}")
+
+    return created
 
 def load_config(config_dir="."):
     """Load ``defaults.py`` and ``sources.py`` from ``config_dir``.
