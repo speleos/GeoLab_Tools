@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools>=77", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "das-processor"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Processing tools for Distributed Acoustic Sensing (DAS) data: MiniSEED export, StationXML, event plots, filtering and whale detection"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -52,3 +52,6 @@ namespaces = false
 # Ships the two configuration templates (defaults.py, sources.py) inside the wheel.
 [tool.setuptools.package-data]
 das_processor = ["templates/*.py"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0"   # used when there is no git metadata (e.g. a ZIP download)
