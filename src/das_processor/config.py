@@ -13,7 +13,8 @@ import importlib.util
 from importlib.resources import files
 from pathlib import Path
 
-TEMPLATES = ("defaults.py", "sources.py")
+TEMPLATES = ("defaults.py", "sources.py", "baleen_whale_detector_defaults.py")
+WHALE_TEMPLATES = ("FIN", "BLUE", "SEI", "MINKE", "HUMPBACK")
 
 
 def init_config(dest=".", overwrite=False):
@@ -51,21 +52,7 @@ def init_config(dest=".", overwrite=False):
     importlib.invalidate_caches()
     return created
 
-
-def load_module(path, name):
-    """Load a Python file as a module, without adding it to ``sys.modules``."""
-    path = Path(path).resolve()
-    if not path.exists():
-        raise FileNotFoundError(
-            f"{path} not found. Run `das-processor init` or `init_config()` "
-            "to create the template files."
-        )
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-def init_whale_templates(dest="whale_templates", prefixes=None, overwrite=False):
+def init_whale_templates(dest=".", prefixes=None, overwrite=False):
     """Copy whale template files into ``dest``, optionally filtered by prefix.
 
     Parameters
@@ -111,6 +98,19 @@ def init_whale_templates(dest="whale_templates", prefixes=None, overwrite=False)
         print(f"No templates found matching prefixes {prefixes}")
 
     return created
+
+def load_module(path, name):
+    """Load a Python file as a module, without adding it to ``sys.modules``."""
+    path = Path(path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Run `das-processor init` or `init_config()` "
+            "to create the template files."
+        )
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 def load_config(config_dir="."):
     """Load ``defaults.py`` and ``sources.py`` from ``config_dir``.
