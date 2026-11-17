@@ -45,8 +45,6 @@ from scipy.signal.windows import gaussian,hann
 
 import subprocess
 
-from das_processor.templates.baleen_whale_detector_defaults import ENV_WIN
-
 #check if code is running in jupyter
 if hasattr(builtins, "__IPYTHON__"):
     from tqdm.notebook import tqdm
@@ -3565,8 +3563,10 @@ class DASProcessor:
         print(f'Interspace spacing={st_every_other[1].stats.distance-st_every_other[0].stats.distance} from {st_every_other[0].stats.distance} to {st_every_other[-1].stats.distance}. {len(st_every_other)} traces.')
         print("Finished plotting record section.")
 
-    def baleen_whale_detector(self, event, species=None, template=None, template_fs=100, detection_mode='single', channel_idx=None, band_detect=(15,25), env_win=0.2,\
-                          spec_source="raw", spec_fmin=10, spec_fmax=40, spec_nperseg=1042, spec_noverlap=900, spec_nfft=2048, spec_dr=15, cmap="jet"):
+    def baleen_whale_detector(self, event, species=None, template=None, template_fs=100, detection_mode='single', channel_idx=None,\
+                              band_detect=(15,25), env_win=0.2, thresh=4.5, min_dist= 8.0, search_win_sec= 1.0, corr_thresh= 0.15,\
+                              spec_source="raw", spec_fmin=10, spec_fmax=40, spec_nperseg=1042, spec_noverlap=900, spec_nfft=2048,\
+                              spec_dr=15, cmap="jet"):
         """
         Detect template-matched baleen whale calls in the event's DAS data.
 
@@ -3737,7 +3737,7 @@ class DASProcessor:
             for i, tr in enumerate(stream):
                 x_raw = tr.data.astype(np.float64)
                 fs = float(tr.stats.sampling_rate)
-                x_det = bandpass(x_raw, fs, *BAND_DETECT)
+                x_det = bandpass(x_raw, fs, *band_detect)
                 peaks.append(np.nanmax(np.abs(x_det)))
             return int(np.nanargmax(peaks))
 
@@ -3750,7 +3750,7 @@ class DASProcessor:
             tpl, tpl_plus, n_tpl, half_pulse_samp, n_search_window = prepare_template(fs)
 
             # Detection trace
-            x_det = bandpass(x_raw, fs, * bad_detect)
+            x_det = bandpass(x_raw, fs, * band_detect)
 
             env = np.abs(x_det)
 
@@ -4002,7 +4002,7 @@ class DASProcessor:
         start_time = plot_result["start_time"]
     
         t = np.arange(len(amp_smooth)) / fs
-        x_spec = x_raw if SPEC_SOURCE == "raw" else x_det
+        x_spec = x_raw if spec_source == "raw" else x_det
     
         f, tt, Sxx = spectrogram(
             x_spec,
@@ -4064,7 +4064,7 @@ class DASProcessor:
             f_edges,
             Sxx_db[sel, :],
             shading="flat",
-            cmap=CMAP,
+            cmap=cmap,
             vmin=vmin,
             vmax=vmax
         )
