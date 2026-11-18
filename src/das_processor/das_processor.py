@@ -1476,6 +1476,67 @@ class DASProcessor:
     
         return False
 
+    def delete_event_data(self, event, dry_run=True):
+        """Delete raw DAS files overlapping the event's configured time range."""
+        start_time = self.event_info.get("start_time")
+
+        if self.event_info.get("end_time") is None and self.event_info.get("duration") is not None:
+            duration_event = self.event_info.get("duration")
+            if not isinstance(duration_event, (int, float)):
+                raise ValueError(f"Event {event!r} has an invalid 'duration' value.")
+            end_time = start_time + datetime.timedelta(seconds=duration_event)    
+        
+        if start_time is None or end_time is None:
+            raise ValueError(
+                f"Event {event!r} must define both 'start_time' and 'end_time' "
+                "to delete its DAS data."
+            )
+
+        duration = (end_time - start_time).total_seconds()
+        if duration <= 0:
+            raise ValueError(f"Event {event!r} has an invalid time range.")
+
+        experiment_path = self.path_params.get("experiment_path")
+        if not experiment_path:
+            raise ValueError("The DAS experiment path is not configured.")
+
+        files, _, _ = find_DAS_files(
+            experiment_path,
+            start=start_time,
+            duration=duration,
+            show_header_info=self.exec_params.get("verbose", False),
+            load_file_from_start=False,
+        )
+
+        warning = f"WARNING: deleting raw DAS data for event {event}."
+        print(warning)
+        logging.warning(warning)
+        print(
+            f"Deletion summary:\n"
+            f"  Time range: {start_time} to {end_time}\n"
+            f"  Experiment path: {experiment_path}\n"
+            f"  {len(files)} files selected :"
+        )
+        for filepath in files:
+            print(f"  - {filepath}")
+
+        if not files:
+            print("No matching DAS files found; nothing was deleted.")
+            logging.info(f"No DAS files found for event {event}; nothing was deleted.")
+            return []
+
+        if dry_run:
+            print("Dry run enabled; no files were deleted.")
+            logging.info(f"Dry run: no DAS files deleted for event {event}.")
+        else:
+            for filepath in files:
+                os.remove(filepath)
+            message=f"Deleted {len(files)} DAS files for event {event}."
+            print(message)
+            logging.info(message)
+
+        return
+
     def load_event_data(self, event, mode='seismic', replace_DAS=False):
         """
         The main pipeline execution method. 
