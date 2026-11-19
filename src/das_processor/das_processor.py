@@ -54,7 +54,45 @@ else:
 
 _LOG_FILE = None
 
-def setup_logging(log_dir=".", level=logging.INFO):
+# Colormaps whose midpoint is meaningful (zero for signed data).
+_DIVERGING_CMAPS = frozenset({
+    'PiYG', 'PRGn', 'BrBG', 'PuOr', 'RdGy', 'RdBu', 'RdYlBu', 'RdYlGn',
+    'Spectral', 'coolwarm', 'bwr', 'seismic',
+    'berlin', 'managua', 'vanimo',          # matplotlib >= 3.10
+})
+
+# Colormaps that run from low to high with no meaningful centre.
+# Cyclic maps (twilight, hsv) are listed here: their wrap-around point is
+# not a "zero", so symmetric limits don't help.
+_NON_DIVERGING_CMAPS = frozenset({
+    'viridis', 'plasma', 'inferno', 'magma', 'cividis', 'turbo',
+    'gray', 'binary', 'Greys', 'Blues', 'Greens', 'Oranges', 'Reds',
+    'Purples', 'YlOrRd', 'YlGnBu', 'hot', 'afmhot', 'gist_heat', 'copper',
+    'bone', 'cubehelix', 'jet', 'rainbow', 'gist_rainbow', 'nipy_spectral',
+    'twilight', 'twilight_shifted', 'hsv',
+})
+
+INT32_MAX = np.iinfo(np.int32).max
+# Scale applied to the data before int32 conversion, per resolution label.
+# This table must be the single source for BOTH dfdas_to_mseed (multiplier)
+# and the stage_gain written below. Keep only one definition in the module.
+INT32_SCALES = {"picostrain": 1e12, "nanostrain": 1e9, "microstrain": 1e6}
+
+# (stage name, output units, units description) for each resolution label
+_INT32_STAGE_TEXT = {
+    "picostrain": ("Picostrain to Counts Resolution Mapping", "PICOSTRAIN",
+                   "Picostrain units (1e-12 strain)"),
+    "nanostrain": ("Nanostrain to Counts Resolution Mapping", "NANOSTRAIN",
+                  "Nanostrain units (1e-9 strain)"),
+    "microstrain": ("Microstrain to Counts Resolution Mapping", "MICROSTRAIN",
+                    "Microstrain units (1e-6 strain)"),
+}
+
+###########################################
+############# Helper functions ############
+###########################################
+
+def _setup_logging(log_dir=".", level=logging.INFO):
     """Attach a log file handler once per session. Safe to call repeatedly.
 
     Returns the path of the log file.
@@ -105,7 +143,7 @@ def validate_sources(sources) -> dict:
     Validates a dictionary of source configurations against defined rules:
     1. Must have 'start_time' and either 'window_duration' or 'end_time'.
     2. Entries with type 'seismic' must have 'magnitude', 'latitude', 'longitude', and 'depth'.
-    3. All entries except 's3_download' and 'data_delete' mode must have 'channel_ranges'.
+    3. All entries except 's3_download' and 'delete_data' mode must have 'channel_ranges'.
     4. All entries must have 'type' and 'mode'.
     
     Returns a dictionary of error messages for each entry.
@@ -130,8 +168,8 @@ def validate_sources(sources) -> dict:
                 if field not in config:
                     errors.append(f"Seismic entry missing required field: '{field}'")
                     
-        # Requirement 3: All entries except 's3_download' and 'data_delete' must have 'channel_ranges' and 'type'
-        if config.get("mode") not in ("s3_download", "data_delete"):
+        # Requirement 3: All entries except 's3_download' and 'delete_data' must have 'channel_ranges' and 'type'
+        if config.get("mode") not in ("s3_download", "delete_data"):
             if "type" not in config:
                 errors.append("Missing required field: 'type'")
             if "channel_ranges" not in config:
@@ -145,125 +183,6 @@ def validate_sources(sources) -> dict:
             validation_errors[name] = errors
 
     return validation_errors
-
-def process_events(events_to_process, global_params):
-    setup_logging()
-    import time
-    
-    sources = global_params.get("sources", {})
-    station = global_params.get("exec_params", {}).get("station", "")   
-    station_coordinates = global_params.get("station_coordinates", {})
-    exec_params = global_params.get("exec_params", {})
-
-    # Output the execution parameters used to the log file and console if verbose is enabled
-    if exec_params.get("verbose"):
-        print("exec_params:")
-
-    logging.info("EXEC Parameters are:")
-    for key, value in exec_params.items():
-        if value:
-            logging.info(f"{key}: {value}")
-            if exec_params.get("verbose"):
-                print(f"{key}: {value}")
-    logging.info('#############################')
-
-    validate_source_channel_ranges(events_to_process, global_params)
-    validate_seismic_event_fields(events_to_process, global_params)
-
-    if not any(event in sources for event in events_to_process):
-        logging.error("List of events to process did not match any event in sources.py.")
-        logging.info("Nothing to do in `process_events`")
-        print(f"List of events to process ({events_to_process}) did not match any event in sources.py.")
-        print("Nothing to process.")
-        return None
-    
-    print("######################")
-    print('»»» Processing event windows.')
-    for event in tqdm(events_to_process, desc="Processing events"):
-        if not event in sources:
-            valid_events = "\n".join(key for key in sources)
-            print(f'{event} not in list of defined events.\nValid events are:\n{valid_events}')
-            continue
-        else:
-            print(f'Working on event: {event}.')
-
-        print(f'#########################\n#########################\n\n')
-        print(f'Processing event {event}. station: {station},station_coordinates: {station_coordinates[station]}')
-
-        start_time_event = time.time()
-
-        # 1. Initialize
-        DAS = DASProcessor(global_params)
-        DAS.event_info = sources.get(event, {})
-
-        # Get the operation mode, defaulting to 'seismic' if not specified
-        event_mode = DAS.event_info.get("mode", "")
-        print(f"Event mode: {event_mode}")
-        success = False
-
-        with DAS.temporary_event_paths(event):
-            if event_mode == "time_lapse":
-                logging.info(f"Processing time lapse for event: {event}")
-                DAS.process_time_lapse(event)
-
-            elif event_mode == "s3_download":
-                logging.info(f"Downloading data from S3 for event: {event}")
-                success=get_data_from_S3(
-                bucket_name=DAS.event_info["s3_bucket"],
-                endpoint_url=DAS.event_info["endpoint_url"],
-                starttime=datetime.datetime.fromisoformat(DAS.event_info["start_time"]),
-                endtime=datetime.datetime.fromisoformat(DAS.event_info["end_time"]),
-                local_path=DAS.event_info["DAS_data_path"],
-                unsigned=DAS.event_info["unsigned"]
-            )
-                if success:
-                    print(f"S3 download for {event} completed successfully.")
-                    success = False
-            elif event_mode == "delete_data":
-                logging.info(f"Deleting data for event: {event}")
-                DAS.delete_event_data(event)
-            else:
-                # 2. Load event (check if files exist, load data, populate metadata)
-                logging.info(f"Loading event data for event: {event} in mode: {event_mode}")
-                success = DAS.load_event_data(event, mode=event_mode)
-
-            # 3. Check result
-            if success:
-                print("Event data loaded successfully!")
-                print(f"Shape of DAS data (samples x channels): {DAS.dfdas.shape}")
-                print(f"DFDAS start time: {DAS.datetime_start}, duration: {DAS.duration} seconds.")
-                logging.info(f"Event data loaded successfully for event: {event}\nShape of DAS data (samples x channels): {DAS.dfdas.shape}\nDFDAS start time: {DAS.datetime_start}, duration: {DAS.duration} seconds.")
-
-                event_info = DAS.sources.get(event, {})
-                process_chain = event_info.get('process_chain')
-                if process_chain: # This evaluates to True if it's a non-empty list
-                    logging.info(f"Executing process chain for {event}...")
-                    print(f"Executing process chain for {event}...")
-                    DAS.run_process_chain() 
-                    print("Process chain completed.")
-                else:
-                    logging.info(f"No process chain defined for {event}. Skipping automated steps.")
-                    print(f"No process chain defined for {event}. Skipping automated steps.")
-            elif event_mode != "time_lapse":
-                logging.error(f"Event processing failed or no data was found for event: {event}")
-                print("Event processing failed or no data was found.")
-
-            end_time_event = time.time()
-            elapsed_time = end_time_event - start_time_event
-
-        print(f"\n>>> FINISHED: {event}")
-        print(f">>> Execution time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
-        print("#########################\n")
-
-        if event_mode == "time_lapse" or event_mode == "s3_download" or event_mode == "delete_data":
-            print(f'Processing mode "{event_mode}" does not require data loading.\nNo data is available for further processing.')
-        else:
-            print(f"Loaded data for {event} was returned.")
-
-    if "DAS" not in locals() or DAS is None:
-        print("No data loaded.")
-        logging.warning("No data loaded.")
-    return DAS
 
 def validate_source_channel_ranges(
     events_to_process: list[str], global_params: dict
@@ -286,8 +205,7 @@ def validate_source_channel_ranges(
                 f"{event}: '{source_type}' does not exist in the defined channel_ranges."
             )
 
-
-def validate_seismic_event_fields(
+def _validate_seismic_event_fields(
     events_to_process: list[str], global_params: dict
 ) -> None:
     """Require seismic source metadata only for selected seismic events."""
@@ -311,6 +229,95 @@ def validate_seismic_event_fields(
                 f"{', '.join(missing_fields)}."
             )
 
+
+def _is_diverging_cmap(cmap):
+    """
+    True if cmap is a known diverging map, False if a known non-diverging
+    map, None if it is in neither set. Handles reversed ('_r') names and
+    Colormap objects.
+    """
+    name = cmap if isinstance(cmap, str) else getattr(cmap, "name", "")
+    base = name[:-2] if name.endswith("_r") else name
+    if base in _DIVERGING_CMAPS:
+        return True
+    if base in _NON_DIVERGING_CMAPS:
+        return False
+    return None
+
+
+def _auto_clim(data, cmap, pct=98, symmetric=None):
+    """
+    Colour limits for imshow/pcolormesh that suit the colormap.
+
+    symmetric: True forces (-v, v); False uses the data percentiles;
+    None (default) decides from the colormap sets above. A colormap in
+    neither set is treated as non-diverging, with a warning.
+    """
+    if symmetric is None:
+        symmetric = _is_diverging_cmap(cmap)
+        if symmetric is None:
+            warnings.warn(
+                f"Colormap {cmap!r} is not classified as diverging or "
+                "non-diverging; using data percentiles. Pass symmetric=True "
+                "for a diverging map.", stacklevel=2)
+            symmetric = False
+    if symmetric:
+        vmax = np.percentile(np.abs(data), pct)
+        return -vmax, vmax
+    lo, hi = np.percentile(data, [100 - pct, pct])
+    return lo, hi
+
+def check_int32_scaling(data, scale, min_bits=16):
+    """
+    Verify that data * scale fits in int32. Raises before any conversion.
+
+    Raises ValueError for NaN/inf, OverflowError if the scaled peak exceeds
+    int32. Logs a warning if the scaled peak is so small that the integer
+    output has fewer than min_bits of dynamic range.
+    Returns the scaled peak.
+    """
+    arr = np.asarray(data)
+    peak = float(np.max(np.abs(arr)))          # NaN/inf propagate through max
+    if not np.isfinite(peak):
+        n_nan = int(np.isnan(arr).sum())
+        n_inf = int(np.isinf(arr).sum())
+        raise ValueError(
+            f"Cannot convert to int32: data contain {n_nan} NaN and {n_inf} "
+            "inf values. Fix or mask them before scaling.")
+    scaled_peak = peak * scale
+    if scaled_peak > INT32_MAX:
+        raise OverflowError(
+            f"int32 overflow: peak |value| {peak:.3e} x scale {scale:.0e} = "
+            f"{scaled_peak:.3e} exceeds {INT32_MAX}. Largest usable scale is "
+            f"{INT32_MAX / peak:.3e}; use a smaller scale/resolution or write "
+            "float32 MiniSEED instead.")
+    if 0 < scaled_peak < 2 ** min_bits:
+        logging.warning(
+            "int32 output has little dynamic range: scaled peak is %.1f "
+            "counts (< 2^%d). Most of the signal will be lost to rounding; "
+            "check the data units and chosen scale.", scaled_peak, min_bits)
+    return scaled_peak
+
+def design_decimation_fir(factor, window=("kaiser", 5.0)):
+    """
+    The anti-alias FIR that scipy.signal.resample_poly designs by default for
+    up=1, down=factor (Kaiser beta=5, 20*factor+1 taps, cutoff at the new Nyquist).
+    """
+    half_len = 10 * factor
+    return sps.firwin(2 * half_len + 1, 1.0 / factor, window=window)
+
+def _record_decimation(self, domain, factor, input_rate, *, b=None, a=None, fir=None, label=None):
+    if (fir is None) == (b is None or a is None):
+        raise ValueError("Provide either fir, or both b and a.")
+    self.stationxml_params["decimation_steps"].append({
+        "domain": domain,
+        "factor": int(factor),
+        "input_sampling_rate": float(input_rate),
+        "fir": None if fir is None else np.asarray(fir),
+        "b": None if b is None else np.asarray(b),
+        "a": None if a is None else np.asarray(a),
+        "label": label,
+    })
 
 class DictFile(File):
     """Read and write HDF5 files as nested Python dictionaries."""
@@ -896,6 +903,7 @@ def create_time_axis(
         start="0s", periods=nSamples, freq="%dns" % int(dt * 1e9 + 0.5)
     )
 
+        
 
 def unwrap(
     phi: np.ndarray, wrapStep: float = 2 * np.pi, axis: int = -1
@@ -1250,6 +1258,130 @@ def load_DAS_files(
         )
     return dfdas
 
+########################################
+###### Event processing functions ######
+########################################
+
+def process_events(events_to_process, global_params):
+    _setup_logging()
+    import time
+    
+    sources = global_params.get("sources", {})
+    station = global_params.get("exec_params", {}).get("station", "")   
+    station_coordinates = global_params.get("station_coordinates", {})
+    exec_params = global_params.get("exec_params", {})
+
+    # Output the execution parameters used to the log file and console if verbose is enabled
+    if exec_params.get("verbose"):
+        print("exec_params:")
+
+    logging.info("EXEC Parameters are:")
+    for key, value in exec_params.items():
+        if value:
+            logging.info(f"{key}: {value}")
+            if exec_params.get("verbose"):
+                print(f"{key}: {value}")
+    logging.info('#############################')
+
+    validate_source_channel_ranges(events_to_process, global_params)
+    _validate_seismic_event_fields(events_to_process, global_params)
+
+    if not any(event in sources for event in events_to_process):
+        logging.error("List of events to process did not match any event in sources.py.")
+        logging.info("Nothing to do in `process_events`")
+        print(f"List of events to process ({events_to_process}) did not match any event in sources.py.")
+        print("Nothing to process.")
+        return None
+    
+    print("######################")
+    print('»»» Processing event windows.')
+    for event in tqdm(events_to_process, desc="Processing events"):
+        if not event in sources:
+            valid_events = "\n".join(key for key in sources)
+            print(f'{event} not in list of defined events.\nValid events are:\n{valid_events}')
+            continue
+        else:
+            print(f'Working on event: {event}.')
+
+        print(f'#########################\n#########################\n\n')
+        print(f'Processing event {event}. station: {station},station_coordinates: {station_coordinates[station]}')
+
+        start_time_event = time.time()
+
+        # 1. Initialize
+        DAS = DASProcessor(global_params)
+        DAS.event_info = sources.get(event, {})
+
+        # Get the operation mode, defaulting to 'seismic' if not specified
+        event_mode = DAS.event_info.get("mode", "")
+        print(f"Event mode: {event_mode}")
+        success = False
+
+        with DAS.temporary_event_paths(event):
+            if event_mode == "time_lapse":
+                logging.info(f"Processing time lapse for event: {event}")
+                DAS.process_time_lapse(event)
+
+            elif event_mode == "s3_download":
+                logging.info(f"Downloading data from S3 for event: {event}")
+                success=get_data_from_S3(
+                bucket_name=DAS.event_info["s3_bucket"],
+                endpoint_url=DAS.event_info["endpoint_url"],
+                starttime=UTCDateTime(DAS.event_info.get("start_time")),
+                endtime=UTCDateTime(DAS.event_info.get("end_time")),
+                local_path=DAS.event_info["DAS_data_path"],
+                unsigned=DAS.event_info["unsigned", False]
+            )
+                if success:
+                    print(f"S3 download for {event} completed successfully.")
+                    success = False
+            elif event_mode == "delete_data":
+                logging.info(f"Deleting data for event: {event}")
+                DAS.delete_event_data(event)
+            else:
+                # 2. Load event (check if files exist, load data, populate metadata)
+                logging.info(f"Loading event data for event: {event} in mode: {event_mode}")
+                success = DAS.load_event_data(event, mode=event_mode)
+
+            # 3. Check result
+            if success:
+                print("Event data loaded successfully!"
+                      f"Shape of DAS data (samples x channels): {DAS.dfdas.shape}"
+                      f"DFDAS start time: {DAS.datetime_start}, duration: {DAS.duration} seconds.")
+                logging.info(f"Event data loaded successfully for event: {event}\n"
+                             f"Shape of DAS data (samples x channels): {DAS.dfdas.shape}\n"
+                             f"DFDAS start time: {DAS.datetime_start}, duration: {DAS.duration} seconds.")
+
+                event_info = DAS.sources.get(event, {})
+                process_chain = event_info.get('process_chain')
+                if process_chain: # This evaluates to True if it's a non-empty list
+                    logging.info(f"Executing process chain for {event}...")
+                    print(f"Executing process chain for {event}...")
+                    DAS.run_process_chain() 
+                    print("Process chain completed.")
+                else:
+                    logging.info(f"No process chain defined for {event}. Skipping automated steps.")
+                    print(f"No process chain defined for {event}. Skipping automated steps.")
+            elif event_mode != "time_lapse":
+                logging.error(f"Event processing failed or no data was found for event: {event}")
+                print("Event processing failed or no data was found.")
+
+            end_time_event = time.time()
+            elapsed_time = end_time_event - start_time_event
+
+        print(f"\n>>> FINISHED: {event}")
+        print(f">>> Execution time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+        print("#########################\n")
+
+        if event_mode == "time_lapse" or event_mode == "s3_download" or event_mode == "delete_data":
+            print(f'Processing mode "{event_mode}" does not require data loading.\nNo data is available for further processing.')
+        else:
+            print(f"Loaded data for {event} was returned.")
+
+    if "DAS" not in locals() or DAS is None:
+        print("No data loaded.")
+        logging.warning("No data loaded.")
+    return DAS
 
 # define class for storing results
 
@@ -1268,8 +1400,7 @@ class DASProcessor:
 
         self.stationxml_params={
                                 "input_sampling_rate": [],
-                                "filter_a_coefficients": [],
-                                "filter_b_coefficients": [],
+                                "decimation_steps": [],
                                 }
         self.network = self.exec_params.get("network", "5V")  # Default to '5V' if not specified
 
@@ -1299,7 +1430,25 @@ class DASProcessor:
         self.chIndex = []
 
         # Set up basic logging configuration with execution timestamp
-        setup_logging()
+        _setup_logging()
+
+    def _record_decimation(self, domain, factor, input_rate, b, a):
+        """domain: 'dfdas' (applied to self.dfdas) or 'stream' (applied to self.mseed_stream)."""
+        self.stationxml_params["decimation_steps"].append({
+            "domain": domain,
+            "factor": int(factor),
+            "input_sampling_rate": float(input_rate),
+            "b": np.asarray(b),
+            "a": np.asarray(a),
+        })
+
+    def _reset_decimation_history(self, domain=None):
+        """Drop recorded steps for one domain, or all of them if domain is None."""
+        steps = self.stationxml_params["decimation_steps"]
+        if domain is None:
+            steps.clear()
+        else:
+            steps[:] = [s for s in steps if s["domain"] != domain]
 
     def get_current_params(self):
         """Returns the internal state in the old dictionary format for compatibility."""
@@ -1417,7 +1566,7 @@ class DASProcessor:
             method(**call_params)
             logging.info(f"Completed step: {operation}")
 
-    def get_time_lapse_windows(self, event):
+    def get_time_lapse_windows(self):
         """Generates start times for continuous windows."""
         start_time = UTCDateTime(self.event_info.get("start_time"))
         end_time = UTCDateTime(self.event_info.get("end_time"))
@@ -1427,7 +1576,7 @@ class DASProcessor:
         current = start_time
         while current < end_time:
             start_times.append(current)
-            current += duration
+            current += datetime.timedelta(seconds=duration)
 
         print(f'{len(start_times)} windows of {duration}s to process')
         return start_times, duration
@@ -1437,7 +1586,7 @@ class DASProcessor:
         print(f'»»» Working on time lapse: {event}')
         
         # 1. Generate the windows
-        start_times, window_duration = self.get_time_lapse_windows(event)
+        start_times, window_duration = self.get_time_lapse_windows()
         self.duration = window_duration # Set window length for the processor
 
         events_path = self.path_params.get("events_path")
@@ -1478,17 +1627,20 @@ class DASProcessor:
 
     def delete_event_data(self, event, dry_run=True):
         """Delete raw DAS files overlapping the event's configured time range."""
-        start_time = self.event_info.get("start_time")
+
+        start_time=UTCDateTime(self.event_info.get("start_time")),
 
         if self.event_info.get("end_time") is None and self.event_info.get("duration") is not None:
             duration_event = self.event_info.get("duration")
             if not isinstance(duration_event, (int, float)):
                 raise ValueError(f"Event {event!r} has an invalid 'duration' value.")
             end_time = start_time + datetime.timedelta(seconds=duration_event)    
+        else:
+            end_time = UTCDateTime(self.event_info.get("end_time"))
         
         if start_time is None or end_time is None:
             raise ValueError(
-                f"Event {event!r} must define both 'start_time' and 'end_time' "
+                f"Event {event!r} must define both 'start_time' and 'end_time' or 'start_time' and 'duration' "
                 "to delete its DAS data."
             )
 
@@ -1550,6 +1702,9 @@ class DASProcessor:
         self.event = event
         station = self.exec_params.get("station")
         
+        # reset decimation history
+        self._reset_decimation_history(domain='dfdas')
+
         # Accessing sources (ensure sources is available globally or passed in)
         self.acquisition_params["gps_status"] = self.sources.get(event, {}).get("GPS", False)
         
@@ -1672,14 +1827,14 @@ class DASProcessor:
                 ap = self.acquisition_params # Shorthand reference
                 ap["roi_step"] = self.roi_step
                 ap["gps_status"] = hf_in['/monitoring/Gps/gpsStatus'][()]
-                ap["gauge_lenght"] = hf_in['/header/gaugeLength'][()]
+                ap["gauge_length"] = hf_in['/header/gaugeLength'][()]
                 ap["dx"] = hf_in['/header/dx'][()]
                 ap["original_sample_rate"] = 1.0 / hf_in['/header/dt'][()]
                 ap["sensitivity"] = hf_in['/header/sensitivities'][0][0]
                 ap["sensitivityUnits"] = hf_in['/header/sensitivityUnits'][0].decode('utf-8')
                 
                 # Calculate overlap
-                ap["overlap"] = ap["roi_step"] * ap["dx"] / ap["gauge_lenght"]
+                ap["overlap"] = ap["roi_step"] * ap["dx"] / ap["gauge_length"]
 
         return self.files, self.roi_step, self.first_chan, self.last_chan
 
@@ -1707,7 +1862,8 @@ class DASProcessor:
             logging.warning("ROI step is not set. Attempting to retrieve from loaded data.")
             self.roi_step = self.filemeta['demodSpec']['roiDec'][0]
             if self.roi_step is None:
-                logging.warning("ROI step could not be retrieved from current dfdas data. Attempting to retrieve from files.")
+                logging.warning("ROI step could not be retrieved from current dfdas data."
+                                 " Attempting to retrieve from files.")
                 experiment_path = self.path_params.get("experiment_path")
                 start_time = UTCDateTime(einfo.get("start_time")).datetime
                 self.get_roi_step(experiment_path, start_time)
@@ -1726,7 +1882,8 @@ class DASProcessor:
         else:
             if self.clock_offset == 0:
                 logging.warning("No GPS timing reported, but clock was not corrected.")
-                print(f"No GPS timing reported, but clock was not corrected.\nRevise 'clock_offset' parameter in defaults.py")
+                print(f"No GPS timing reported, but clock was not corrected.\n"
+                      f"Revise 'clock_offset' parameter in defaults.py")
 
         # Logic for Seismic vs Other types
         if einfo.get("type", "").startswith('seismic'):
@@ -2140,14 +2297,38 @@ class DASProcessor:
         self.dfdas.to_csv(full_path, index=True, header=True)
 
 
-    def dfdas_to_mseed(self,event,write=False,format=None,dType=None,decimate=False,filename=None, stationXML=False):
+    def dfdas_to_mseed(self, event, write=False, format=None, dType=None, decimate=False,
+                       filename=None, stationXML=False, int_resolution='picostrain'):
         """
         Converts the stored self.dfdas (Pandas) into an ObsPy Stream object.
         Uses class attributes for metadata and configuration.
         """
+        # Short aliases for cleaner code
+        ep, ap, pp, th = self.exec_params, self.acquisition_params, self.path_params, self.trace_header[self.network]
+
+        if self.dfdas is None:
+            print("No data loaded in self.dfdas. Run load_dfdas_file() first.")
+            return None
+
+        # reset decimation history for mseed output
+        self._reset_decimation_history(domain='stream')
+
+        use_int = dType == "int"
+        if use_int:
+            if int_resolution not in INT32_SCALES:
+                raise ValueError(f"int_resolution must be one of {list(INT32_SCALES)}")
+            scale = INT32_SCALES[int_resolution]
+            print(f"Scaling data by {scale:.0e} ({int_resolution}) for int32 MiniSEED.")
+            # Stop here, before any trace is built, if the data won't fit.
+            check_int32_scaling(self.dfdas.to_numpy(), scale)
+            self.stationxml_params["int32_resolution"] = int_resolution
+        else:
+            # Float output: no counts mapping, so the key must not exist.
+            # pop() with a default also clears a label left by an earlier int32 export.
+            self.stationxml_params.pop("int32_resolution", None)
 
         if dType == 'int':
-            print(f'Scaling data by a factor of 1x10^12 to match int32 range for MSEED output.\nNew data type is {dType}.')
+            print(f'Scaling data by a factor of {scale:.0e} to match int32 range for MSEED output.\nNew data type is {dType}.')
         print(f'params: event:{event} write:{write} format:{format} dType:{dType} decimate:{decimate} filename:{filename}')
         if self.dfdas is None:
             print("No data loaded in self.dfdas. Run load_dfdas_file() first.")
@@ -2155,19 +2336,11 @@ class DASProcessor:
         else:
             print("Converting to ObsPy Stream")
 
-        # Short aliases for cleaner code
-        ep, ap, pp, th = self.exec_params, self.acquisition_params, self.path_params, self.trace_header[self.network]
-
-        self.stationxml_params["int32_resolution"]='picostrain'
-
         self.mseed_stream=Stream()
         for channel in self.dfdas.columns[:]:
             tr = Trace()
-            tr.data = self.dfdas[channel].to_numpy().astype(float)  # Convert to dType. default is float.
-            if dType=="int":
-                tr.data = tr.data*1e6  # Scale to int32 range for MSEED. 
-                self.stationxml_params["int32_resolution"]='picostrain'
-                tr.data = tr.data.astype(np.int32) # Convert to int32 for MSEED
+            data = self.dfdas[channel].to_numpy().astype(float)  # Convert to dType. default is float.
+            tr.data = np.rint(data * scale).astype(np.int32) if use_int else data
             tr.stats.starttime = UTCDateTime(self.dfdas.meta["time"])
             tr.stats.sampling_rate = 1/self.dfdas.meta["dt"]
 
@@ -2193,12 +2366,12 @@ class DASProcessor:
             self.mseed_stream.append(tr)
 
         if decimate:
-            self.mseed_stream=self.decimate_st(self.mseed_stream,self.get_current_params())
+            self.mseed_stream=self.decimate_st()
 
         if stationXML:
             if ep.get("verbose"):
                 print("Creating StationXML file for the current stream.")
-                station_xml_creation(self.mseed_stream,self.get_current_params())   
+            station_xml_creation(self.mseed_stream,self.get_current_params())   
 
         if write in ['stream', True]:
             mseed_filename = filename if filename else f'{event}_{self.mseed_stream[0].stats.sampling_rate}Hz.mseed'
@@ -2313,12 +2486,13 @@ class DASProcessor:
 
         # Dynamic color scaling based on data if not provided
         if vmin is None or vmax is None:
-            vmax = np.percentile(np.abs(corr_matrix), 98)  # Clip top 2% outliers for better contrast
-            vmin = np.percentile(np.abs(corr_matrix), 2)   # Clip bottom 2% outliers for better contrast
+            auto_min, auto_max = _auto_clim(corr_matrix, cmap)
+            vmin = auto_min if vmin is None else vmin
+            vmax = auto_max if vmax is None else vmax       
 
         im = plt.imshow(corr_matrix, aspect='auto', extent=extent, cmap=cmap, vmin=vmin, vmax=vmax)
 
-        plt.colorbar(im, label='Correlation Coefficient')
+        plt.colorbar(im, label='Cross-Correlation Amplitude')
         plt.title('DAS Cross-Correlation Matrix (Waterfall Plot)', fontsize=14, pad=15)
         plt.xlabel('Lag Time (seconds)', fontsize=12)
         plt.ylabel('Distance (metres)', fontsize=12)
@@ -2364,29 +2538,48 @@ class DASProcessor:
         plt.show()
     
     def decimate_st(self):
-        ep, fp, sp = self.exec_params , self.freq_params, self.stationxml_params
-
-        st=self.mseed_stream
+        ep, fp = self.exec_params, self.freq_params
+        st = self.mseed_stream
 
         for decimation in fp.get("decimation_factor"):
+            fs = st[0].stats.sampling_rate
             print(f'Decimation factor: {decimation}')
-            new_nyquist = st[0].stats.sampling_rate / 2.0 / decimation
-            b,a=get_cheby2_coeffs(st[0].stats.sampling_rate * 0.5,new_nyquist)
-            sp["input_sampling_rate"].append(st[0].stats.sampling_rate)
-            sp["filter_a_coefficients"].append(a)
-            sp["filter_b_coefficients"].append(b)
+            new_nyquist = fs / 2.0 / decimation
+
+            # Same coefficients zerophase_chebyshev_lowpass_filter will use, so the
+            # recorded FIR is derived from exactly what is applied.
+            b, a = get_cheby2_coeffs(fs * 0.5, new_nyquist)
+            fir = zerophase_effective_fir(b, a)
+
             for tr in st:
                 zerophase_chebyshev_lowpass_filter(tr, new_nyquist)
             st.decimate(factor=decimation, no_filter=True)
+
+            self._record_decimation("stream", decimation, fs, fir=fir,
+                                    label="Zero-phase Chebyshev II (filtfilt) low-pass")
             if ep.get("verbose"):
                 print(st[0].stats.sampling_rate)
         return st
 
-    def reduce_velocity_st(self, global_params, vred=5.0, offset=None):
-        ep, fp = global_params['exec_params'] , global_params['freq_params']
+    def reduce_velocity_st(self, vred=5.0, offset=0):
+        """Return a copy of the MiniSEED stream with a linear moveout applied.
+
+        Adds ``offset`` meters to each trace's distance, then shifts its
+        start time earlier by that distance divided by ``vred`` (in km/s).
+        The result is also stored in ``self.mseed_reduced_velocity``.
+
+        Args:
+            vred: Reduction velocity in kilometers per second.
+            offset: Distance offset in meters applied to every trace.
+
+        Returns:
+            The reduced-velocity copy of ``self.mseed_stream``.
+        """
+        print(f'Reducing velocity to {vred} km/s with an offset of {offset} meters.')
 
         st=self.mseed_stream.copy()
-        if offset is not None:
+        
+        if offset != 0:
             print(f'An offset of {offset} meters with be added to every distance.')
 
         for tr in st:
@@ -2409,7 +2602,7 @@ class DASProcessor:
         Updates self.dfdas and its metadata in-place.
         """
 
-        fp, sp = self.freq_params, self.stationxml_params
+        fp = self.freq_params
 
         if self.dfdas is None:
             print("Data not found in memory. Attempting to load before decimation...")
@@ -2427,12 +2620,15 @@ class DASProcessor:
             print(f'Decimating at a factor of {decimation}')
             
             # update stationXML params for each decimation step
-            original_sampling_frequency = 1/self.dfdas.meta['dt']
-            new_nyquist = original_sampling_frequency * 0.5 / decimation
-            b,a=get_cheby2_coeffs(original_sampling_frequency,new_nyquist)
-            sp["input_sampling_rate"].append(original_sampling_frequency)
-            sp["filter_a_coefficients"].append(a)
-            sp["filter_b_coefficients"].append(b)
+            original_sampling_frequency = 1 / self.dfdas.meta['dt']
+
+            # Filter once, apply it, and record that same array
+            fir = design_decimation_fir(decimation)
+            sig_decimated = sps.resample_poly(self.dfdas.to_numpy(),
+                                              up=1, down=decimation, axis=0,
+                                              window=fir, padtype='edge')
+            self._record_decimation("dfdas", decimation, original_sampling_frequency,
+                                    fir=fir, label="Linear-phase FIR (Kaiser) low-pass")
             
             # 1. Capture current dimensions
             nt_in = self.dfdas.shape[0]
@@ -2445,7 +2641,14 @@ class DASProcessor:
             
             # 3. Calculate new timing metadata
             nt_out = sig_decimated.shape[0]
-            dt_out = self.dfdas.meta['dt'] * (nt_in / nt_out)
+            dt_out = self.dfdas.meta['dt'] * decimation
+            
+            #iCheck if meta['time'] is stale
+            if isinstance(self.dfdas.index, pd.DatetimeIndex):
+                tstart = self.dfdas.index[0].to_pydatetime(warn=False)
+            else:
+                tstart = self.dfdas.meta['time']
+            
             tstart = self.dfdas.meta['time'] # + datetime.timedelta(seconds=0)
             
             # Use your helper to create the new index
@@ -2462,11 +2665,23 @@ class DASProcessor:
                 columns=self.dfdas.columns, 
                 meta=meta_out
             )
-            
+
+            # dimensionSizes is rebuilt by DASDataFrame.__init__; verify it matches the data
+            # Just in case a specific channel layout introduces a mismatch, we log a warning.
+            if tuple(self.dfdas.meta["dimensionSizes"]) != self.dfdas.shape:
+                logging.warning(
+                    f"dimensionSizes {tuple(self.dfdas.meta['dimensionSizes'])} "
+                    f"!= data shape {self.dfdas.shape} after decimation.")           
+
             print(f"New sampling rate: {1/dt_out} Hz")
-            # CRITICAL: Clear the cached ObsPy stream because the underlying 
+
+            # Clear the cached ObsPy stream because the underlying 
             # data (sampling rate/length) has changed.
+            
             self.mseed_stream = None 
+            
+            # reset decimation history for the stream domain after decimation
+            self._reset_decimation_history(domain='stream')
 
         return self.dfdas
 
@@ -3223,60 +3438,72 @@ class DASProcessor:
 
         return st
 
-    def fk_filter(self, vmin=1400,vmax=99999):
+    def fk_filter(self, vmin=1400,vmax=99999,sigma=(10,10), taper=None):
         """
-        Apply FK filter to the data
+        Apparent-velocity (f-k) pass filter on self.dfdas, in place.
+
+        Keeps energy with vmin <= |f/k| <= vmax (m/s).
+        vmax=None means no upper limit. sigma is the Gaussian taper width of the
+        mask edge, in (frequency bins, wavenumber bins).
         """
 
-        print(f"Applying FK filter with vmin={vmin}, vmax={vmax}.")
+        if self.dfdas is None:
+            print("No data loaded; nothing to filter.")
+            logging.warning("FK filter called with no data loaded.")
+            return None
 
+        logging.info(f"Applying FK filter with vmin={vmin}, vmax={vmax}, sigma={sigma}.")
+
+        data = self.dfdas.to_numpy()            # (nt, nx): time x channel
+        nt,nx = data.shape
+        
         # Get the Discrete Fourier Transform sample frequencies...
         dt = self.dfdas.meta['dt']
         dx = self.dfdas.meta['dx']
-        nnx = self.dfdas.meta["dimensionSizes"][1]
-        nns = self.dfdas.meta["dimensionSizes"][0]
-        f = np.fft.fftfreq(nns,d=dt)
-        k = np.fft.fftfreq(nnx,d=dx)
 
-        f = np.fft.fftshift(f)
-        k = np.fft.fftshift(k)
+        # Optional Tukey taper (broadcast per axis, no full 2-D window needed)
+        if taper is not None:
+            a_t, a_x = (taper, taper) if np.isscalar(taper) else taper
+            for a in (a_t, a_x):
+                if a is not None and not 0 <= a <= 1:
+                    raise ValueError(f"Tukey alpha must be in [0, 1], got {a}.")
+            data = data.astype(np.float32, copy=True)
+            if a_t:
+                data *= sps.windows.tukey(nt, alpha=a_t).astype(np.float32)[:, None]
+            if a_x:
+                data *= sps.windows.tukey(nx, alpha=a_x).astype(np.float32)[None, :]
 
-#        if self.mseed_stream is None:
-#            self.dfdas_to_mseed(self.event, write=False, format=None, dType=float, decimate=False)
+        # Real FFT along time (non-negative f only), full FFT along space.
+        # The mask depends on |f| and |k|, so this is equivalent to fft2.
+        spec = np.fft.fft(np.fft.rfft(data, axis=0), axis=1)
+
+        f = np.fft.rfftfreq(nt, d=dt)[:, None]  # (nt//2+1, 1)
+        k = np.abs(np.fft.fftfreq(nx, d=dx))[None, :]  # (1, nx)
+
+        # Velocity test written without dividing by k (no 1e-10 hack needed)
+        mask = f >= vmin * k
+        if vmax is not None:
+            mask &= f <= vmax * k
+        mask = mask.astype(np.float32)
+
+        # Taper the mask edges to reduce ringing. Frequency axis is not periodic
+        # (rfft layout), wavenumber axis is (unshifted fft layout).
+        mask = ndimage.gaussian_filter(mask, sigma=sigma, mode=("nearest", "wrap"))
+
+        out = np.fft.irfft(np.fft.ifft(spec * mask, axis=1), n=nt, axis=0)
+
+        self.dfdas = DASDataFrame(
+            out,
+            index=self.dfdas.index,
+            columns=self.dfdas.columns,
+            meta=self.dfdas.meta.copy(),
+        )
+
+        if self.mseed_stream is not None:
+            self.mseed_stream = self.dfdas_to_mseed(self.event)   # update mseed stream to match the data
+            logging.info("FK filter applied and mseed stream updated.")
         
-        # Compute the 2-dimensional discrete Fourier Transform...
-        # Compute the 2D FFT and center the zero-frequency/wavenumber
-        ft2s =np.fft.fftshift(
-                              np.fft.fft2(self.dfdas) # check if it should be transposed or not
-                              )
-
-        # Return a list of coordinate matrices from coordinate vectors...
-        F,K = np.meshgrid(f,k)
-        del f, k
-
-        # Change null values to very small ones to be able to divide afterwards.
-        K = np.where(K==0, 1e-10, K)
-        C = F/K
-
-        # Create filter mask...
-        # Create a mask of zeros in the same shape as C.
-        filt = np.zeros(C.shape)
-        # Create a mask to "mute" entries by replacing zeros with ones where C is in the desired range.
-        condition = np.logical_and(np.abs(C) >= vmin, np.abs(C) <= vmax)
-        filt[condition] = 1.
-
-        # Blur mask.
-        filt_blur = ndimage.gaussian_filter(filt, sigma=10)
-
-        # Apply mask...
-        ft2_filt = ft2s * filt_blur
-        # del fts2
-        ft2s_filt = np.fft.ifftshift(ft2_filt)
-        del ft2_filt  # to save memory
-        # Invert FFT.
-        self.dfdas = np.fft.ifft2(ft2s_filt)
-
-        return self.mseed_stream
+        return self.dfdas, self.mseed_stream
 
     def plot_record_sections(self, dataset=None, event=None, suffix=""):
         # Use class attributes for configuration to integrate with DASProcessor
@@ -4206,11 +4433,14 @@ def get_coordinates(channel, global_params,roi_channel=False):
     else:
         filtered_df = df.loc[df['CHANNEL'] == channel]
 
-   # TODO: replace hardcoded coordinates with a default value or raise an error if no match is found 
     if len(filtered_df) == 0:
-        lat=32.64441
-        lon=-16.94396
-        ele=20
+        logging.warning(f"No coordinates found for channel {channel}. Using default coordinates.")
+        if ep.get("verbose"):
+            print(f"No coordinates found for channel {channel}. Using default coordinates.")
+        from defaults import default_cable_coordinates
+        lat=default_cable_coordinates['latitude']
+        lon=default_cable_coordinates['longitude']
+        ele=default_cable_coordinates['elevation']
     else:
         lat=filtered_df['LATITUDE'].values[0]
         lon=filtered_df['LONGITUDE'].values[0]
@@ -4239,11 +4469,10 @@ def encode_station_name(prefix,distance,global_params):
     code = f"{prefix}{converted_distance:0{code_length}d}"
 
     if ep.get("verbose"):
-        print(f'Encoded station: name: {code} - distance={distance} code_lenght={code_length} division_factor={factor}')
+        print(f'Encoded station: name: {code} - distance={distance} code_length={code_length} division_factor={factor}')
     return code
 
-
-def station_xml_creation(st,global_params):
+def station_xml_creation(st, global_params):
     """
     Create a StationXML file from an ObsPy Stream `st` using configuration in `global_params`.
 
@@ -4251,173 +4480,183 @@ def station_xml_creation(st,global_params):
     - st: ObsPy Stream containing station traces with coordinates and metadata.
     - global_params: dictionary with acquisition, path, exec, freq, trace header and stationxml params.
 
+    The decimation stages are built from sp["decimation_steps"], i.e. from what
+    was actually applied to the data, not from freq_params["decimation_factor"].
+
     Side effects:
-    - Writes StationXML to `pp.get("MSEED_path")` and may raise KeyError if coordinates missing.
+    - Writes StationXML to `pp.get("MSEED_path")`.
+
+    Raises:
+    - KeyError if a trace has no latitude/longitude/elevation.
+    - ValueError if the recorded decimation history does not reproduce the
+      stream's sampling rate, or if int32_resolution is not a known label.
     """
-    ap, pp, ep  = global_params['acquisition_params'] , global_params['path_params'], global_params['exec_params']
-    fp, th, sp = global_params['freq_params'], global_params['trace_header'], global_params['stationxml_params']
-    
-    #get filter params
-    a,b=get_cheby2_coeffs(st[0].stats.sampling_rate*0.5,50)
+    ap, pp, ep = global_params['acquisition_params'], global_params['path_params'], global_params['exec_params']
+    th, sp = global_params['trace_header'], global_params['stationxml_params']
+
     for tr in st:
-        for coord in ["latitude","longitude","elevation"]:
+        for coord in ["latitude", "longitude", "elevation"]:
             if coord not in tr.stats.coordinates:
                 print(f'Station {tr.stats.station} has no {coord} field!\nStationXML file not created.')
                 raise KeyError(f"Missing '{coord}' in tr.stats.coordinates")
-                return
 
-    response_stages=[]
-    dummy_response_stage=[]
-    
-    response_stages=[PolesZerosResponseStage(stage_sequence_number=1,
-                                             name="Gain",
-                                             stage_gain=1,
-                                             stage_gain_frequency=1.0,
-                                             input_units="counts",
-                                             output_units="counts",
-                                             input_units_description=ap["sensitivityUnits"],
-                                             output_units_description=ap["sensitivityUnits"],
-                                             normalization_factor=1,
-                                             normalization_frequency=0,
-                                             pz_transfer_function_type="LAPLACE (RADIANS/SECOND)",
-                                             zeros=[],
-                                             poles=[])
-                    ]
+    # --- Decimation history -------------------------------------------------
+    steps = sp.get("decimation_steps", [])
+    total_decimation = math.prod(s["factor"] for s in steps)   # 1 if no steps
 
-    for i in range(len(fp.get("decimation_factor"))):
-    # Extract coefficients and parameters for the current stage
-        decimation_factor = fp["decimation_factor"][i]
-        input_sampling_rate = sp["input_sampling_rate"][i]
-        a_coefficients = sp["filter_a_coefficients"][i].tolist()
-        b_coefficients = sp["filter_b_coefficients"][i].tolist()
+    # The recorded history must explain the data's sampling rate. If steps were
+    # applied before this data was loaded (or state drifted), the response
+    # would be wrong, so stop here instead of writing it.
+    expected_rate = ap["original_sample_rate"] / total_decimation
+    actual_rate = st[0].stats.sampling_rate
+    if not np.isclose(expected_rate, actual_rate, rtol=1e-6):
+        raise ValueError(
+            f"Decimation history is inconsistent with the data: "
+            f"original_sample_rate / total decimation = {expected_rate} Hz, "
+            f"but the stream is at {actual_rate} Hz. Steps applied before this "
+            f"data was loaded are not recorded, so the StationXML response "
+            f"would be wrong.")
 
-        # Create a CoefficientsTypeResponseStage object
-        dummy_response_stage = CoefficientsTypeResponseStage(
-            stage_sequence_number=i + 2,  # Stage sequence starts at 1
-            name=f"Low-pass Chebishev filter stage + Decimation step {i + 1}. Decimation factor: {decimation_factor}",
+    # --- Response stages ----------------------------------------------------
+    response_stages = [
+        PolesZerosResponseStage(
+            stage_sequence_number=1,
+            name="Gain",
+            stage_gain=1,
+            stage_gain_frequency=1.0,
+            input_units="counts",
+            output_units="counts",
+            input_units_description=ap["sensitivityUnits"],
+            output_units_description=ap["sensitivityUnits"],
+            normalization_factor=1,
+            normalization_frequency=0,
+            pz_transfer_function_type="LAPLACE (RADIANS/SECOND)",
+            zeros=[],
+            poles=[],
+        )
+    ]
+
+    for i, step in enumerate(steps):
+        fir = step.get("fir")
+        if fir is not None:
+            # Linear-phase FIR applied by resample_poly (decimate_dfdas).
+            # The filter delay, (ntaps-1)/2 samples, is removed by resample_poly
+            # (output is centred), so delay == correction.
+            fir = np.asarray(fir, dtype=float)
+            delay = ((len(fir) - 1) / 2) / step["input_sampling_rate"]
+            stage_name = (f"Linear-phase FIR (Kaiser) low-pass + Decimation step {i + 1}. "
+                          f"Decimation factor: {step['factor']}")
+            numerator, denominator = fir.tolist(), []
+        else:
+            # Zero-phase Chebyshev II applied by decimate_st (filtfilt)
+            delay = 0
+            stage_name = (f"Low-pass Chebyshev filter stage + Decimation step {i + 1}. "
+                          f"Decimation factor: {step['factor']}")
+            numerator = np.asarray(step["b"]).tolist()
+            denominator = np.asarray(step["a"]).tolist()
+
+        response_stages.append(CoefficientsTypeResponseStage(
+            stage_sequence_number=i + 2,
+            name=stage_name,
             cf_transfer_function_type="DIGITAL",
-            stage_gain_frequency=1.0,  # Frequency at which the gain is defined
+            stage_gain_frequency=1.0,
             stage_gain=1,
             input_units="counts",
             output_units="counts",
             input_units_description=ap["sensitivityUnits"],
             output_units_description=ap["sensitivityUnits"],
-            decimation_factor=decimation_factor,  # Set decimation factor
-            decimation_input_sample_rate=input_sampling_rate,  # Input sample rate
+            decimation_factor=step["factor"],
+            decimation_input_sample_rate=step["input_sampling_rate"],
+            decimation_offset=0,
+            decimation_delay=delay,
+            decimation_correction=delay,
+            denominator=denominator,
+            numerator=numerator,
+        ))
+
+    last_stage = len(response_stages) + 1
+    output_rate = ap["original_sample_rate"] / total_decimation
+
+    response_stages.append(CoefficientsTypeResponseStage(
+        stage_sequence_number=last_stage,
+        name="Sensitivity",
+        cf_transfer_function_type="DIGITAL",
+        numerator=[],
+        denominator=[],
+        decimation_factor=1,
+        decimation_correction=0,
+        decimation_delay=0,
+        decimation_offset=0,
+        decimation_input_sample_rate=output_rate,
+        stage_gain=ap["sensitivity"],
+        stage_gain_frequency=1.0,
+        input_units="counts",
+        output_units="counts",
+        input_units_description=ap["sensitivityUnits"],
+        output_units_description=ap["sensitivityUnits"],
+    ))
+
+    # Counts -> physical units stage, only for int32 output. stage_gain comes
+    # from the same table dfdas_to_mseed multiplies by, so they cannot differ.
+    resolution = sp.get("int32_resolution")
+    if ep.get("verbose"):
+        print(f"int32_resolution: {resolution}")
+    if resolution is not None:
+        if resolution not in INT32_SCALES or resolution not in _INT32_STAGE_TEXT:
+            raise ValueError(
+                f"Unknown int32_resolution {resolution!r}; "
+                f"expected one of {list(INT32_SCALES)}.")
+        stage_name, out_units, out_desc = _INT32_STAGE_TEXT[resolution]
+        response_stages.append(CoefficientsTypeResponseStage(
+            stage_sequence_number=last_stage + 1,
+            name=stage_name,
+            cf_transfer_function_type="DIGITAL",
+            stage_gain=INT32_SCALES[resolution],
+            stage_gain_frequency=1.0,
+            input_units="counts",
+            output_units=out_units,
+            input_units_description="Digital counts mapped to int32",
+            output_units_description=out_desc,
+            numerator=[],
+            denominator=[],
+            decimation_factor=1,
             decimation_offset=0,
             decimation_delay=0,
             decimation_correction=0,
-            denominator=a_coefficients,  # Denominator (a) coefficients
-            numerator=b_coefficients,  # Numerator (b) coefficients
-        )
-        response_stages.append(dummy_response_stage)
-    
-    last_stage=len(response_stages)+1
-    dummy_response_stage=CoefficientsTypeResponseStage(stage_sequence_number=last_stage,
-                                  name="Sensitivity",
-                                  cf_transfer_function_type="DIGITAL",
-                                  numerator=[],
-                                  denominator=[],
-                                  decimation_factor=1,
-                                  decimation_correction=0,
-                                  decimation_delay=0,
-                                  decimation_offset=0,
-                                  decimation_input_sample_rate=ap.get("original_sample_rate")/math.prod(fp["decimation_factor"]),
-                                  stage_gain=ap["sensitivity"],
-                                  stage_gain_frequency=1.0,
-                                  input_units="counts",
-                                  output_units="counts",
-                                  input_units_description=ap["sensitivityUnits"],
-                                  output_units_description=ap["sensitivityUnits"],
-                                  )
+            decimation_input_sample_rate=output_rate,
+        ))
 
-    response_stages.append(dummy_response_stage)
-
-    print(sp.get("int32_resolution"))
-
-    if sp.get("int32_resolution")== 'picostrain':
-        picostrain_stage = CoefficientsTypeResponseStage(
-                                 stage_sequence_number=last_stage + 1,
-                                 name="Picostrain to Counts Resolution Mapping",
-                                 cf_transfer_function_type="DIGITAL",
-                                 stage_gain=1e12, 
-                                 stage_gain_frequency=1.0,
-                                 input_units="counts",
-                                 output_units="PICOSTRAIN",
-                                 input_units_description="Digital counts mapped to int32",
-                                 output_units_description="Picostrain units (1e-12 strain)",
-                                 numerator=[],
-                                 denominator=[],
-                                 decimation_factor=1,
-                                 decimation_offset=0,
-                                 decimation_delay=0,
-                                 decimation_correction=0,
-                                 decimation_input_sample_rate=ap.get("original_sample_rate")/math.prod(fp["decimation_factor"])
-                )
-        response_stages.append(picostrain_stage)
-    
-    if sp.get("int32_resolution")== 'microstrain':
-        microstrain_stage = CoefficientsTypeResponseStage(
-                                 stage_sequence_number=last_stage + 1,
-                                 name="Microstrain to Counts Resolution Mapping",
-                                 cf_transfer_function_type="DIGITAL",
-                                 stage_gain=1e6, 
-                                 stage_gain_frequency=1.0,
-                                 input_units="counts",
-                                 output_units="MICROSTRAIN",
-                                 input_units_description="Digital counts mapped to int32",
-                                 output_units_description="Microstrain units (1e-6 strain)",
-                                 numerator=[],
-                                 denominator=[],
-                                 decimation_factor=1,
-                                 decimation_offset=0,
-                                 decimation_delay=0,
-                                 decimation_correction=0,
-                                 decimation_input_sample_rate=ap.get("original_sample_rate")/math.prod(fp["decimation_factor"])
-        )
-        response_stages.append(microstrain_stage)
-
-    response=Response(
-    resource_id="OptoDAS header",
-    instrument_sensitivity=InstrumentSensitivity(
-        value=ap["sensitivity"],
-        frequency=1.0,
-        input_units="counts",
-        output_units="counts",
-        output_units_description="strain per meter",
-        input_units_description=ap["sensitivityUnits"]+" phase difference expressed in radians per strain per meter",
-        frequency_range_start=0.001,
-        frequency_range_end=2000.0,
-        frequency_range_db_variation=0,
+    response = Response(
+        resource_id="OptoDAS header",
+        instrument_sensitivity=InstrumentSensitivity(
+            value=ap["sensitivity"],
+            frequency=1.0,
+            input_units="counts",
+            output_units="counts",
+            output_units_description="strain per meter",
+            input_units_description=ap["sensitivityUnits"] + " phase difference expressed in radians per strain per meter",
+            frequency_range_start=0.001,
+            frequency_range_end=2000.0,
+            frequency_range_db_variation=0,
         ),
         response_stages=response_stages)
-    
-    sensor=Equipment(
-        type="DAS",
-        description="OptoDAS",
-        manufacturer="ASN",
-        serial_number="44",
-        installation_date=UTCDateTime(*th.get("net_starttime")),
-        resource_id="OptoDAS_44"
+
+    # --- Equipment / operator / network ------------------------------------
+    install_date = UTCDateTime(*th.get("net_starttime"))
+
+    def _das_equipment():
+        return Equipment(
+            type="DAS",
+            description="OptoDAS",
+            manufacturer="ASN",
+            serial_number="44",
+            installation_date=install_date,
+            resource_id="OptoDAS_44",
         )
-    data_logger=Equipment(
-        type="DAS",
-        description="OptoDAS",
-        manufacturer="ASN",
-        serial_number="44",
-        installation_date=UTCDateTime(*th.get("net_starttime")),
-        resource_id="OptoDAS_44"
-        )
-    pre_amplifier=Equipment(
-        type="DAS",
-        description="OptoDAS",
-        manufacturer="ASN",
-        serial_number="44",
-        installation_date=UTCDateTime(*th.get("net_starttime")),
-        resource_id="OptoDAS_44"
-        )
-    
-    operator=[
+
+    sensor, data_logger, pre_amplifier = _das_equipment(), _das_equipment(), _das_equipment()
+
+    operator = [
         Operator(
             agency="ARDITI",
             contacts=[
@@ -4426,16 +4665,13 @@ def station_xml_creation(st,global_params):
                     agencies=["ARDITI, Funchal, Portugal",
                               "Instituto Dom Luiz, Lisboa, Portugal"],
                     emails=["maloureiro@fc.ul.pt"])],
-                    website="www.arditi.pt"
-                )
-            ]
+            website="www.arditi.pt",
+        )
+    ]
 
-    inv=Inventory(
-        networks=[],
-        source=th.get("inventory_source"),
-    )
+    inv = Inventory(networks=[], source=th.get("inventory_source"))
 
-    net=Network(
+    net = Network(
         code=st[0].stats.network,
         stations=[],
         description=th.get("net_description"),
@@ -4446,27 +4682,28 @@ def station_xml_creation(st,global_params):
     )
 
     for tr in st:
-        station_code=tr.stats.station
+        station_code = tr.stats.station
         if ep.get("encode_station_name"):
             das_channel = tr.stats['decoded_station']
         else:
             das_channel = tr.stats.station
-    
-        sta=Station(
-                code=station_code,
-                latitude=tr.stats.coordinates["latitude"],
-                longitude=tr.stats.coordinates["longitude"],
-                elevation=tr.stats.coordinates["elevation"],
-                creation_date=UTCDateTime(*th.get("net_starttime")),
-                start_date=UTCDateTime(ap.get("start_date")),
-                end_date=UTCDateTime(ap.get("end_date")),
-                site=Site(name=f'{th.get("sta_name_prefix")} {tr.stats.channel} channel no.{str(das_channel).zfill(5)}'),
-                total_number_of_channels=1,
-        )
-        sta.operators=operator
 
-        azimuth,dip=get_azimuth_dip(int(tr.stats.distance/ap.get("dx")+1),global_params,roi_channel=False)
-        cha=Channel(code="HSF",
+        sta = Station(
+            code=station_code,
+            latitude=tr.stats.coordinates["latitude"],
+            longitude=tr.stats.coordinates["longitude"],
+            elevation=tr.stats.coordinates["elevation"],
+            creation_date=install_date,
+            start_date=UTCDateTime(ap.get("start_date")),
+            end_date=UTCDateTime(ap.get("end_date")),
+            site=Site(name=f'{th.get("sta_name_prefix")} {tr.stats.channel} channel no.{str(das_channel).zfill(5)}'),
+            total_number_of_channels=1,
+        )
+        sta.operators = operator
+
+        azimuth, dip = get_azimuth_dip(int(tr.stats.distance / ap.get("dx") + 1), global_params, roi_channel=False)
+        cha = Channel(
+            code="HSF",
             location_code=th.get("location"),
             latitude=tr.stats.coordinates["latitude"],
             longitude=tr.stats.coordinates["longitude"],
@@ -4476,19 +4713,19 @@ def station_xml_creation(st,global_params):
             sample_rate=tr.stats.sampling_rate,
             depth=0,
             azimuth=azimuth,
-            dip=dip
+            dip=dip,
         )
-        cha.response=response
-        cha.equipments=[sensor,data_logger, pre_amplifier]
-        cha.sensor=sensor
-        cha.data_logger=data_logger
-        cha.pre_amplifier=pre_amplifier
+        cha.response = response
+        cha.equipments = [sensor, data_logger, pre_amplifier]
+        cha.sensor = sensor
+        cha.data_logger = data_logger
+        cha.pre_amplifier = pre_amplifier
         sta.channels.append(cha)
         net.stations.append(sta)
 
     inv.networks.append(net)
 
-    file=os.path.join(pp.get("MSEED_path"),f'RESP.{th.get("network")}.HSF.xml')
+    file = os.path.join(pp.get("MSEED_path"), f'RESP.{th.get("network")}.HSF.xml')
     os.makedirs(pp.get("MSEED_path"), exist_ok=True)
     inv.write(file, format="stationxml", validate=True)
 
@@ -4497,7 +4734,7 @@ def station_xml_creation(st,global_params):
 
     if ep.get("verbose", False) == 2:
         print(inv)
-        inv[0][-1][0].response.plot(min_freq=0.01,unwrap_phase=True)
+        inv[0][-1][0].response.plot(min_freq=0.01, unwrap_phase=True)
 
     return
 
@@ -4545,6 +4782,21 @@ def get_cheby2_coeffs(nyquist, freqmax):
 
     b, a = signal.cheby2(order, rs, wn, btype="low", analog=0, output="ba")
     return b,a
+
+def zerophase_effective_fir(b, a, tol=1e-6, max_len=200_000):
+    """
+    Effective FIR of signal.filtfilt(b, a, x): the autocorrelation of the IIR
+    impulse response, truncated where it falls below tol * peak.
+    Symmetric, odd length, DC gain ~1.
+    """
+    imp = np.zeros(max_len)
+    imp[0] = 1.0
+    h = signal.lfilter(b, a, imp)
+    big = np.nonzero(np.abs(h) > tol * np.max(np.abs(h)))[0]
+    if big[-1] >= max_len - 1:
+        raise ValueError("IIR impulse response did not decay within max_len samples")
+    h = h[:big[-1] + 1]
+    return signal.fftconvolve(h, h[::-1])
 
 def zerophase_chebyshev_lowpass_filter(trace, freqmax):
         """

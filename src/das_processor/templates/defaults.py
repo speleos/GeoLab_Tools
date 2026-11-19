@@ -20,6 +20,12 @@ path_params={
     "figures_path": './FIGURES/'
 }
 
+default_cable_coords={
+        "latitude": 32.64441,
+        "longitude": -16.94396,
+        "elevation": 20
+        }
+
 clock_offset=150
 
 # default parameters for frequency analysis
