@@ -1,5 +1,6 @@
 import inspect
 import datetime
+import time
 import os
 import re
 import warnings
@@ -37,11 +38,15 @@ from matplotlib.dates import DateFormatter
 from matplotlib.gridspec import GridSpec
 from matplotlib.colors import ListedColormap # Normalize
 from matplotlib.patches import Patch #,ConnectionPatch, Normalize, Rectangle,Patch
+from matplotlib.collections import LineCollection
+
 import scipy.signal as sps
 from scipy import ndimage
-from scipy import signal
 from scipy.signal import hilbert, square, ShortTimeFFT
 from scipy.signal.windows import gaussian,hann
+
+import functools
+import scipy.fft as sfft
 
 import subprocess
 
@@ -114,15 +119,6 @@ def _setup_logging(log_dir=".", level=logging.INFO):
         root.setLevel(level)
     return _LOG_FILE
         
-#    run_time = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-#    log_filename = f'DAS_processor_{run_time}.log'
-#    logging.basicConfig(
-#        level=logging.INFO,
-#        format='%(asctime)s %(levelname)s: %(message)s',
-#        datefmt='%Y-%m-%d %H:%M:%S',
-#        filename=log_filename
-#    )
-
 def create_global_params(defaults, sources, exec_params):
     """Constructs and returns the global configuration dictionary."""
     return {
@@ -306,18 +302,19 @@ def design_decimation_fir(factor, window=("kaiser", 5.0)):
     half_len = 10 * factor
     return sps.firwin(2 * half_len + 1, 1.0 / factor, window=window)
 
-def _record_decimation(self, domain, factor, input_rate, *, b=None, a=None, fir=None, label=None):
+@staticmethod
+def _make_step(factor, input_rate, *, b=None, a=None, fir=None, label=None):
     if (fir is None) == (b is None or a is None):
         raise ValueError("Provide either fir, or both b and a.")
-    self.stationxml_params["decimation_steps"].append({
-        "domain": domain,
+    return {
         "factor": int(factor),
         "input_sampling_rate": float(input_rate),
         "fir": None if fir is None else np.asarray(fir),
         "b": None if b is None else np.asarray(b),
         "a": None if a is None else np.asarray(a),
         "label": label,
-    })
+    }
+
 
 class DictFile(File):
     """Read and write HDF5 files as nested Python dictionaries."""
@@ -520,7 +517,6 @@ class DASDataFrame(pd.DataFrame):
             dimensionSizes=np.r_[self.shape[0], np.sum(size)],
             dimensionUnits=np.array([b"s", b"m"]),
         )
-
 
 def _combine_units(units: list[str], operator: str = "*") -> str:
     """Combine unit strings using multiplication or division."""
@@ -1264,7 +1260,6 @@ def load_DAS_files(
 
 def process_events(events_to_process, global_params):
     _setup_logging()
-    import time
     
     sources = global_params.get("sources", {})
     station = global_params.get("exec_params", {}).get("station", "")   
@@ -1398,11 +1393,9 @@ class DASProcessor:
         self.freq_params = global_params.get('freq_params', {})
         self.clock_offset = global_params.get('clock_offset',0)
 
-        self.stationxml_params={
-                                "input_sampling_rate": [],
-                                "decimation_steps": [],
-                                }
-        self.network = self.exec_params.get("network", "5V")  # Default to '5V' if not specified
+        self.stationxml_params = {}
+        self.dfdas_decimation_steps = []    
+        self.network = self.exec_params.get("network", "XX")  # Default to '5V' if not specified
 
         # Internal state
         self.event_info = {}
@@ -1432,24 +1425,26 @@ class DASProcessor:
         # Set up basic logging configuration with execution timestamp
         _setup_logging()
 
-    def _record_decimation(self, domain, factor, input_rate, b, a):
-        """domain: 'dfdas' (applied to self.dfdas) or 'stream' (applied to self.mseed_stream)."""
-        self.stationxml_params["decimation_steps"].append({
-            "domain": domain,
+
+    @staticmethod
+    def _make_step(factor, input_rate, *, b=None, a=None, fir=None, label=None):
+        if (fir is None) == (b is None or a is None):
+            raise ValueError("Provide either fir, or both b and a.")
+        return {
             "factor": int(factor),
             "input_sampling_rate": float(input_rate),
-            "b": np.asarray(b),
-            "a": np.asarray(a),
-        })
+            "fir": None if fir is None else np.asarray(fir),
+            "b": None if b is None else np.asarray(b),
+            "a": None if a is None else np.asarray(a),
+            "label": label,
+        }
 
-    def _reset_decimation_history(self, domain=None):
-        """Drop recorded steps for one domain, or all of them if domain is None."""
-        steps = self.stationxml_params["decimation_steps"]
-        if domain is None:
-            steps.clear()
-        else:
-            steps[:] = [s for s in steps if s["domain"] != domain]
-
+    def get_decimation_steps(self):
+        """Steps applied to self.dfdas, then those applied to the current stream."""
+        st_steps = (getattr(self.mseed_stream, "decimation_steps", [])
+        if self.mseed_stream is not None else [])
+        return list(self.dfdas_decimation_steps) + list(st_steps)
+    
     def get_current_params(self):
         """Returns the internal state in the old dictionary format for compatibility."""
         return {
@@ -1461,7 +1456,8 @@ class DASProcessor:
             'freq_params': self.freq_params,
             'netwrk': self.network,
             'trace_header': self.trace_header[self.network],
-            'stationxml_params': self.stationxml_params,
+            'stationxml_params': {**self.stationxml_params,
+                                  "decimation_steps": self.get_decimation_steps()},
         }
     
     @contextmanager
@@ -2538,16 +2534,28 @@ class DASProcessor:
         plt.show()
     
     def decimate_st(self):
+        """
+        Decimates self.mseed_stream using the factors in freq_params.
+
+        Each trace is filtered with the zero-phase Chebyshev II low-pass (filtfilt)
+        and then decimated without a further filter. The effective zero-phase FIR
+        of that filter is recorded on the stream (stream.decimation_steps), so the
+        history lives exactly as long as the stream does.
+        """
         ep, fp = self.exec_params, self.freq_params
+
         st = self.mseed_stream
+        if st is None or len(st) == 0:
+            print("No ObsPy Stream found in memory. Run dfdas_to_mseed() first.")
+            return None
 
         for decimation in fp.get("decimation_factor"):
             fs = st[0].stats.sampling_rate
             print(f'Decimation factor: {decimation}')
             new_nyquist = fs / 2.0 / decimation
 
-            # Same coefficients zerophase_chebyshev_lowpass_filter will use, so the
-            # recorded FIR is derived from exactly what is applied.
+            # Same coefficients zerophase_chebyshev_lowpass_filter will use, so
+            # the recorded FIR is derived from exactly what is applied.
             b, a = get_cheby2_coeffs(fs * 0.5, new_nyquist)
             fir = zerophase_effective_fir(b, a)
 
@@ -2555,8 +2563,12 @@ class DASProcessor:
                 zerophase_chebyshev_lowpass_filter(tr, new_nyquist)
             st.decimate(factor=decimation, no_filter=True)
 
-            self._record_decimation("stream", decimation, fs, fir=fir,
-                                    label="Zero-phase Chebyshev II (filtfilt) low-pass")
+            # New list each time: never mutate a list another object may hold
+            st.decimation_steps = list(getattr(st, "decimation_steps", [])) + [
+                self._make_step(
+                    decimation, fs, fir=fir,
+                    label="Zero-phase Chebyshev II (filtfilt) low-pass")]
+
             if ep.get("verbose"):
                 print(st[0].stats.sampling_rate)
         return st
@@ -2605,7 +2617,7 @@ class DASProcessor:
         fp = self.freq_params
 
         if self.dfdas is None:
-            print("Data not found in memory. Attempting to load before decimation...")
+            print("No data loaded.")
             return False
         
         # If factors are passed via process_chain, use them; 
@@ -2617,74 +2629,64 @@ class DASProcessor:
             print(f"Default decimation factors updated to: {factors}")
         
         for decimation in factors:
-            print(f'Decimating at a factor of {decimation}')
-            
-            # update stationXML params for each decimation step
-            original_sampling_frequency = 1 / self.dfdas.meta['dt']
+             # 1. Current dimensions come from the data itself, not from meta
+             nt_in, nx = self.dfdas.shape
+             fs_in = 1 / self.dfdas.meta['dt']
 
-            # Filter once, apply it, and record that same array
-            fir = design_decimation_fir(decimation)
-            sig_decimated = sps.resample_poly(self.dfdas.to_numpy(),
-                                              up=1, down=decimation, axis=0,
-                                              window=fir, padtype='edge')
-            self._record_decimation("dfdas", decimation, original_sampling_frequency,
-                                    fir=fir, label="Linear-phase FIR (Kaiser) low-pass")
-            
-            # 1. Capture current dimensions
-            nt_in = self.dfdas.shape[0]
-            
-            # 2. Perform Resampling
-            # resample_poly includes an anti-aliasing filter automatically
-            sig_decimated = sps.resample_poly(
-                self.dfdas, up=1, down=decimation, axis=0, padtype='edge'
-            )
-            
-            # 3. Calculate new timing metadata
-            nt_out = sig_decimated.shape[0]
-            dt_out = self.dfdas.meta['dt'] * decimation
-            
-            #iCheck if meta['time'] is stale
-            if isinstance(self.dfdas.index, pd.DatetimeIndex):
-                tstart = self.dfdas.index[0].to_pydatetime(warn=False)
-            else:
-                tstart = self.dfdas.meta['time']
-            
-            tstart = self.dfdas.meta['time'] # + datetime.timedelta(seconds=0)
-            
-            # Use your helper to create the new index
-            t = create_time_axis(tstart, nt_out, dt_out)
-            
-            # 4. Update metadata and re-wrap as a DASDataFrame
-            meta_out = self.dfdas.meta.copy()
-            meta_out.update(dt=dt_out, time=tstart)
-            
-            # Overwrite the class attribute with the new decimated version
-            self.dfdas = DASDataFrame(
-                sig_decimated, 
-                index=t, 
-                columns=self.dfdas.columns, 
-                meta=meta_out
-            )
+             # 2. Filter once, apply it, and record that same array
+             fir = design_decimation_fir(decimation)
+             sig_decimated = sps.resample_poly(
+                 self.dfdas.to_numpy(), up=1, down=decimation, axis=0,
+                 window=fir, padtype='edge'
+             )
 
-            # dimensionSizes is rebuilt by DASDataFrame.__init__; verify it matches the data
-            # Just in case a specific channel layout introduces a mismatch, we log a warning.
-            if tuple(self.dfdas.meta["dimensionSizes"]) != self.dfdas.shape:
-                logging.warning(
-                    f"dimensionSizes {tuple(self.dfdas.meta['dimensionSizes'])} "
-                    f"!= data shape {self.dfdas.shape} after decimation.")           
+             # 3. New timing from the new dimensions.
+             # resample_poly returns ceil(nt_in / decimation) samples, so the
+             # sample interval is exactly dt * decimation.
+             nt_out = sig_decimated.shape[0]
+             dt_out = self.dfdas.meta['dt'] * decimation
 
-            print(f"New sampling rate: {1/dt_out} Hz")
+             # Start from the data's own first timestamp: meta['time'] goes stale
+             # after trim_DAS_data (truncate copies meta unchanged).
+             if isinstance(self.dfdas.index, pd.DatetimeIndex):
+                 tstart = self.dfdas.index[0].to_pydatetime(warn=False)
+             else:
+                 tstart = self.dfdas.meta['time']
+             t = create_time_axis(tstart, nt_out, dt_out)
 
-            # Clear the cached ObsPy stream because the underlying 
-            # data (sampling rate/length) has changed.
-            
-            self.mseed_stream = None 
-            
-            # reset decimation history for the stream domain after decimation
-            self._reset_decimation_history(domain='stream')
+             # 4. Rebuild as a DASDataFrame. The constructor recomputes
+             # dimensionSizes / dimensionRanges from the new shape.
+             meta_out = self.dfdas.meta.copy()
+             meta_out.update(dt=dt_out, time=tstart)
+
+             self.dfdas = DASDataFrame(
+                 sig_decimated,
+                 index=t,
+                 columns=self.dfdas.columns,
+                 meta=meta_out
+             )
+
+             # Consistency check: metadata must match the new dimensions
+             if tuple(self.dfdas.meta["dimensionSizes"]) != self.dfdas.shape:
+                 logging.warning(
+                     f"dimensionSizes {tuple(self.dfdas.meta['dimensionSizes'])} "
+                     f"!= data shape {self.dfdas.shape} after decimation.")
+
+             # 5. Record exactly what was applied (kept until new data is loaded)
+             self.dfdas_decimation_steps.append(self._make_step(
+                 decimation, fs_in, fir=fir,
+                 label="Linear-phase FIR (Kaiser) low-pass"))
+
+             print(f"Decimated {nt_in} -> {nt_out} samples x {nx} channels; "
+                   f"new sampling rate: {1/dt_out} Hz")
+
+             # CRITICAL: Clear the cached ObsPy stream because the underlying
+             # data (sampling rate/length) has changed. Its recorded steps
+             # (stored on the stream) go with it.
+             self.mseed_stream = None
 
         return self.dfdas
-
+            
     def plot_spectrogram(self, freq_type="no_filter", suffix=""):
         ep = self.exec_params
         pp = self.path_params
@@ -2875,155 +2877,10 @@ class DASProcessor:
              return False
         
         return True
-
-
-
     
     # ============================================================
     # PLOT METHODS
     # ============================================================
-
-    def plot_seismic_section(self, channel_step=1, scale_factor=1.0, start_offset_km=30.8,
-                              end_offset_km=None, dx_meters=12.5, max_time_s=45.0,
-                              station=None, event=None, suffix="", use_agc=True,
-                              agc_window_s=2.0, agc_clip=4.0, **kwargs):
-        """
-        Record section with wiggle traces, band-passed 0.5-20 Hz, with P/S/T phases.
-        """
-        if self.dfdas is None:
-            print("No data in memory to plot.")
-            return
-
-        event = event or self.event
-        print(f"»»» Generating Record Section for {event}...")
-
-        data = self.dfdas.to_numpy()
-        dt = self.dfdas.meta['dt']
-        fs = 1.0 / dt
-        window_start_utc = UTCDateTime(self.dfdas.meta['time'])
-        time_axis = (self.dfdas.index - self.dfdas.index[0]).total_seconds()
-
-        dx_native = self.dfdas.meta.get('dx', 1.0213001907746815)
-        absolute_offsets_km = (self.dfdas.columns.to_numpy() * dx_native) / 1000.0
-
-        if end_offset_km is None:
-            end_offset_km = start_offset_km + 21.5
-
-        print(f"-> Diagnostics: dx={dx_native:.4f} m/channel | dt={dt:.5f}s (fs={fs:.1f}Hz) | "
-              f"available channel coverage: {absolute_offsets_km.min():.2f} - {absolute_offsets_km.max():.2f} km | "
-              f"data window: {time_axis.min():.1f} - {time_axis.max():.1f} s | "
-              f"window start (UTC): {window_start_utc}")
-
-        spatial_mask = (absolute_offsets_km >= start_offset_km) & (absolute_offsets_km <= end_offset_km)
-        sub_data = data[:, spatial_mask]
-        offsets_km = absolute_offsets_km[spatial_mask]
-
-        if sub_data.shape[1] == 0:
-            print("ERROR: no channels in requested offset range.")
-            return
-
-        time_mask = time_axis <= max_time_s
-        sub_data = sub_data[time_mask, :]
-        plot_time = time_axis[time_mask]
-
-        lowcut, highcut = 0.5, 20.0
-        nyq = 0.5 * fs
-        b, a = sps.butter(4, [lowcut/nyq, highcut/nyq], btype='band')
-        sub_data = sps.filtfilt(b, a, sub_data, axis=0)
-
-        trace_spacing_km = dx_meters / 1000.0
-        target_offsets = np.arange(start_offset_km, end_offset_km, trace_spacing_km)
-        final_offsets = []
-        final_data_indices = []
-        for target in target_offsets:
-            idx = np.abs(offsets_km - target).argmin()
-            if idx not in final_data_indices:
-                final_data_indices.append(idx)
-                final_offsets.append(offsets_km[idx])
-
-        final_data = sub_data[:, final_data_indices]
-        final_offsets = np.array(final_offsets)
-        print(f"-> Plotting {final_data.shape[1]} traces (target spacing: {dx_meters} m).")
-
-        fig, ax = plt.subplots(figsize=(15, 8.5))
-        max_deflection_km = trace_spacing_km * 0.45 * scale_factor
-        agc_win_samples = max(1, int(agc_window_s * fs))
-        agc_kernel = np.ones(agc_win_samples) / agc_win_samples
-
-        for i in range(final_data.shape[1]):
-            traccia = final_data[:, i]
-            traccia = sps.detrend(traccia)
-            traccia = traccia - np.median(traccia)
-            edge_samples = int(0.5 * fs)
-            if edge_samples > 0:
-                traccia[:edge_samples] = 0
-                traccia[-edge_samples:] = 0
-
-            if use_agc:
-                local_power = sps.fftconvolve(traccia**2, agc_kernel, mode='same')
-                local_rms = np.sqrt(np.maximum(local_power, 0))
-                floor = np.median(local_rms[local_rms > 0]) * 0.05 if np.any(local_rms > 0) else 1e-12
-                local_rms = np.maximum(local_rms, floor if floor > 0 else 1e-12)
-                traccia_norm = np.clip(traccia / local_rms, -agc_clip, agc_clip)
-                traccia_km = (traccia_norm / agc_clip) * max_deflection_km
-            else:
-                std_local = np.std(traccia)
-                if std_local == 0:
-                    continue
-                traccia_norm = np.clip(traccia / std_local, -2.5, 2.5)
-                traccia_km = (traccia_norm / 2.5) * max_deflection_km
-
-            ax.plot(final_offsets[i] + traccia_km, plot_time, color='#2c3e50', linewidth=0.4, alpha=0.8)
-
-        # Fasi teoriche
-        ref_station = station or (list(self.station_coordinates.keys())[0] if self.station_coordinates else None)
-        if ref_station is not None:
-            try:
-                rec_lat = self.station_coordinates[ref_station]["latitude"]
-                rec_lon = self.station_coordinates[ref_station]["longitude"]
-                arrivals_p, arrivals_s = get_travel_times(event, self.get_current_params(), rec_lat, rec_lon)
-                src = self.sources.get(event, {})
-                origin_time = UTCDateTime(src.get("start_time"))
-                p_rel = (origin_time + arrivals_p[0].time) - window_start_utc if arrivals_p else None
-                s_rel = (origin_time + arrivals_s[0].time) - window_start_utc if arrivals_s else None
-                epi_dist_km = degrees2kilometers(locations2degrees(
-                    src.get("latitude"), src.get("longitude"), rec_lat, rec_lon))
-                t_rel = (origin_time + epi_dist_km / 1.5) - window_start_utc
-
-                for label, t_val in [("P", p_rel), ("S", s_rel), ("T", t_rel)]:
-                    if t_val is not None and plot_time.min() <= t_val <= plot_time.max():
-                        ax.axhline(t_val, color='crimson', linestyle='--', linewidth=0.7, alpha=0.7)
-                        ax.text(start_offset_km - 0.3, t_val, label, color='crimson',
-                                fontsize=10, fontweight='bold', va='center', ha='right')
-                        ax.text(end_offset_km + 0.3, t_val, label, color='crimson',
-                                fontsize=10, fontweight='bold', va='center', ha='left')
-                    else:
-                        print(f"WARNING: phase {label} at t={t_val} is outside the plotted window "
-                              f"({plot_time.min():.1f}-{plot_time.max():.1f}s).")
-            except Exception as e:
-                print(f"Unable to calculate theoretical phases: {e}")
-
-        ax.set_xlim(start_offset_km, end_offset_km)
-        ax.set_ylim(max_time_s, 0.0)
-        ax.set_xlabel("Offset [km]", fontsize=10, labelpad=10)
-        ax.set_ylabel("Time [s]", fontsize=10, labelpad=10)
-        ax.set_title(f"{event} record section", fontsize=12, pad=15)
-        ax.grid(True, linestyle=':', color='gainsboro', linewidth=0.5)
-        ax.tick_params(top=True, bottom=True, left=True, right=True,
-                       labeltop=True, labelbottom=True, labelleft=True, labelright=True, labelsize=9)
-        ax.set_facecolor('white')
-        fig.patch.set_facecolor('white')
-
-        pp = self.path_params
-        save_path = os.path.join(pp.get("figures_path", "./"), "Seismic_Plots")
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-        event_safe = event.replace(" ", "_")
-        filename = os.path.join(save_path, f"{event_safe}_record_section.png")
-        fig.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {filename}")
-        plt.show()
-        plt.close(fig)
 
     def plot_seismic_2d(self, channel_step=1, start_offset_km=30.8,
                         end_offset_km=50.0, dx_meters=12.5, max_time_s=45.0,
@@ -3213,6 +3070,159 @@ class DASProcessor:
         plt.show()
         plt.close(fig)
 
+    def plot_seismic_section(self, channel_step=1, scale_factor=1.0, start_offset_km=30.8,
+                              end_offset_km=None, dx_meters=12.5, max_time_s=45.0,
+                              station=None, event=None, suffix="", use_agc=True,
+                              agc_window_s=2.0, agc_clip=4.0, **kwargs):
+        """
+        Record section with wiggle traces, band-passed 0.5-20 Hz, with P/S/T phases.
+        """
+        if self.dfdas is None:
+            print("No data in memory to plot.")
+            return
+
+        event = event or self.event
+        print(f"»»» Generating Record Section for {event}...")
+
+        data = self.dfdas.to_numpy()
+        dt = self.dfdas.meta['dt']
+        fs = 1.0 / dt
+        window_start_utc = UTCDateTime(self.dfdas.meta['time'])
+        time_axis = (self.dfdas.index - self.dfdas.index[0]).total_seconds()
+
+        dx_native = self.dfdas.meta.get('dx', 1.0213001907746815)
+        absolute_offsets_km = (self.dfdas.columns.to_numpy() * dx_native) / 1000.0
+
+        if end_offset_km is None:
+            end_offset_km = start_offset_km + 21.5
+
+        print(f"-> Diagnostics: dx={dx_native:.4f} m/channel | dt={dt:.5f}s (fs={fs:.1f}Hz) | "
+              f"available channel coverage: {absolute_offsets_km.min():.2f} - {absolute_offsets_km.max():.2f} km | "
+              f"data window: {time_axis.min():.1f} - {time_axis.max():.1f} s | "
+              f"window start (UTC): {window_start_utc}")
+
+        spatial_mask = (absolute_offsets_km >= start_offset_km) & (absolute_offsets_km <= end_offset_km)
+        sub_data = data[:, spatial_mask]
+        offsets_km = absolute_offsets_km[spatial_mask]
+
+        if sub_data.shape[1] == 0:
+            print("ERROR: no channels in requested offset range.")
+            return
+
+        time_mask = time_axis <= max_time_s
+        sub_data = sub_data[time_mask, :]
+        plot_time = time_axis[time_mask]
+
+        lowcut, highcut = 0.5, 20.0
+        nyq = 0.5 * fs
+        b, a = sps.butter(4, [lowcut/nyq, highcut/nyq], btype='band')
+        sub_data = sps.filtfilt(b, a, sub_data, axis=0)
+
+        trace_spacing_km = dx_meters / 1000.0
+        target_offsets = np.arange(start_offset_km, end_offset_km, trace_spacing_km)
+        final_offsets = []
+        final_data_indices = []
+        for target in target_offsets:
+            idx = np.abs(offsets_km - target).argmin()
+            if idx not in final_data_indices:
+                final_data_indices.append(idx)
+                final_offsets.append(offsets_km[idx])
+
+        final_data = sub_data[:, final_data_indices]
+        final_offsets = np.array(final_offsets)
+        print(f"-> Plotting {final_data.shape[1]} traces (target spacing: {dx_meters} m).")
+
+        fig, ax = plt.subplots(figsize=(15, 8.5))
+        max_deflection_km = trace_spacing_km * 0.45 * scale_factor
+        agc_win_samples = max(1, int(agc_window_s * fs))
+        agc_kernel = np.ones(agc_win_samples) / agc_win_samples
+
+        # One LineCollection for all traces (instead of one ax.plot per channel).
+        # Shared time axis goes in once; x is filled per trace below.
+        segments = np.empty((final_data.shape[1], plot_time.size, 2))
+        segments[:, :, 1] = plot_time
+        n_seg = 0
+
+        for i in range(final_data.shape[1]):
+            traccia = final_data[:, i]
+            traccia = sps.detrend(traccia)
+            traccia = traccia - np.median(traccia)
+            edge_samples = int(0.5 * fs)
+            if edge_samples > 0:
+                traccia[:edge_samples] = 0
+                traccia[-edge_samples:] = 0
+
+            if use_agc:
+                local_power = sps.fftconvolve(traccia**2, agc_kernel, mode='same')
+                local_rms = np.sqrt(np.maximum(local_power, 0))
+                floor = np.median(local_rms[local_rms > 0]) * 0.05 if np.any(local_rms > 0) else 1e-12
+                local_rms = np.maximum(local_rms, floor if floor > 0 else 1e-12)
+                traccia_norm = np.clip(traccia / local_rms, -agc_clip, agc_clip)
+                traccia_km = (traccia_norm / agc_clip) * max_deflection_km
+            else:
+                std_local = np.std(traccia)
+                if std_local == 0:
+                    continue
+                traccia_norm = np.clip(traccia / std_local, -2.5, 2.5)
+                traccia_km = (traccia_norm / 2.5) * max_deflection_km
+
+            segments[n_seg, :, 0] = final_offsets[i] + traccia_km
+            n_seg += 1
+
+        if n_seg:
+            ax.add_collection(LineCollection(segments[:n_seg], colors='#2c3e50',
+                                             linewidths=0.4, alpha=0.8))
+
+        # Fasi teoriche
+        ref_station = station or (list(self.station_coordinates.keys())[0] if self.station_coordinates else None)
+        if ref_station is not None:
+            try:
+                rec_lat = self.station_coordinates[ref_station]["latitude"]
+                rec_lon = self.station_coordinates[ref_station]["longitude"]
+                arrivals_p, arrivals_s = get_travel_times(event, self.get_current_params(), rec_lat, rec_lon)
+                src = self.sources.get(event, {})
+                origin_time = UTCDateTime(src.get("start_time"))
+                p_rel = (origin_time + arrivals_p[0].time) - window_start_utc if arrivals_p else None
+                s_rel = (origin_time + arrivals_s[0].time) - window_start_utc if arrivals_s else None
+                epi_dist_km = degrees2kilometers(locations2degrees(
+                    src.get("latitude"), src.get("longitude"), rec_lat, rec_lon))
+                t_rel = (origin_time + epi_dist_km / 1.5) - window_start_utc
+
+                for label, t_val in [("P", p_rel), ("S", s_rel), ("T", t_rel)]:
+                    if t_val is not None and plot_time.min() <= t_val <= plot_time.max():
+                        ax.axhline(t_val, color='crimson', linestyle='--', linewidth=0.7, alpha=0.7)
+                        ax.text(start_offset_km - 0.3, t_val, label, color='crimson',
+                                fontsize=10, fontweight='bold', va='center', ha='right')
+                        ax.text(end_offset_km + 0.3, t_val, label, color='crimson',
+                                fontsize=10, fontweight='bold', va='center', ha='left')
+                    else:
+                        print(f"WARNING: phase {label} at t={t_val} is outside the plotted window "
+                              f"({plot_time.min():.1f}-{plot_time.max():.1f}s).")
+            except Exception as e:
+                print(f"Unable to calculate theoretical phases: {e}")
+
+        ax.set_xlim(start_offset_km, end_offset_km)
+        ax.set_ylim(max_time_s, 0.0)
+        ax.set_xlabel("Offset [km]", fontsize=10, labelpad=10)
+        ax.set_ylabel("Time [s]", fontsize=10, labelpad=10)
+        ax.set_title(f"{event} record section", fontsize=12, pad=15)
+        ax.grid(True, linestyle=':', color='gainsboro', linewidth=0.5)
+        ax.tick_params(top=True, bottom=True, left=True, right=True,
+                       labeltop=True, labelbottom=True, labelleft=True, labelright=True, labelsize=9)
+        ax.set_facecolor('white')
+        fig.patch.set_facecolor('white')
+
+        pp = self.path_params
+        save_path = os.path.join(pp.get("figures_path", "./"), "Seismic_Plots")
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        event_safe = event.replace(" ", "_")
+        filename = os.path.join(save_path, f"{event_safe}_record_section.png")
+        fig.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {filename}")
+        plt.show()
+        plt.close(fig)
+
     def plot_seismic_enhanced(self, channel_step=8, scale_factor=15.0, 
                                start_offset_km=30.8, end_offset_km=50.0,
                                dx_meters=102.0, max_time_s=40.0,
@@ -3278,12 +3288,16 @@ class DASProcessor:
         trace_spacing_km = offsets_km[1] - offsets_km[0] if len(offsets_km) > 1 else 0.1
         max_deflection = trace_spacing_km * 0.6 * scale_factor
 
+        # One LineCollection for all traces (instead of one ax.plot per channel)
+        segments = np.empty((sub_data.shape[1], plot_time.size, 2))
+        segments[:, :, 1] = plot_time
         for i in range(sub_data.shape[1]):
             trace = sub_data[:, i]
             trace = sps.detrend(trace)
             trace = trace - np.median(trace)
-            ax1.plot(offsets_km[i] + trace * max_deflection / 3.0, 
-                    plot_time, 'k-', linewidth=0.3, alpha=0.7)
+            segments[i, :, 0] = offsets_km[i] + trace * max_deflection / 3.0
+        ax1.add_collection(LineCollection(segments, colors='k',
+                                          linewidths=0.3, alpha=0.7))
 
         ax1.set_ylabel("Time [s]")
         ax1.set_xlim(start_offset_km, end_offset_km)
@@ -3438,59 +3452,74 @@ class DASProcessor:
 
         return st
 
-    def fk_filter(self, vmin=1400,vmax=99999,sigma=(10,10), taper=None):
+    def fk_filter(self, vmin=1400, vmax=None, sigma=(10, 10), taper=None,
+                  dtype=np.float32):
         """
         Apparent-velocity (f-k) pass filter on self.dfdas, in place.
 
-        Keeps energy with vmin <= |f/k| <= vmax (m/s).
-        vmax=None means no upper limit. sigma is the Gaussian taper width of the
-        mask edge, in (frequency bins, wavenumber bins).
-        """
+        Keeps energy with vmin <= |f/k| <= vmax (m/s); vmax=None means no upper
+        limit. sigma is the Gaussian smoothing of the mask edge in
+        (frequency bins, wavenumber bins).
 
+        taper: optional Tukey window applied to the data before the FFT to reduce
+            edge leakage. None disables it (default). A float alpha applies the
+            same fraction to both axes; a tuple (alpha_time, alpha_space) sets
+            them separately (None or 0 disables an axis). alpha=0 is
+            rectangular, 1 is Hann; 0.05-0.2 is typical. The output is tapered too.
+        dtype: working precision. float32 (default) halves memory and keeps the
+            FFT in single precision (scipy.fft preserves it); pass np.float64
+            for double precision.
+
+        Memory: one real-FFT spectrum (about half the size of a full fft2) plus
+        one mask; the mask comes from broadcasting f[:, None] against k[None, :],
+        so no meshgrid arrays are built.
+        """
         if self.dfdas is None:
             print("No data loaded; nothing to filter.")
-            logging.warning("FK filter called with no data loaded.")
             return None
 
-        logging.info(f"Applying FK filter with vmin={vmin}, vmax={vmax}, sigma={sigma}.")
+        print(f"Applying FK filter with vmin={vmin}, vmax={vmax}, taper={taper}.")
 
-        data = self.dfdas.to_numpy()            # (nt, nx): time x channel
-        nt,nx = data.shape
-        
-        # Get the Discrete Fourier Transform sample frequencies...
         dt = self.dfdas.meta['dt']
         dx = self.dfdas.meta['dx']
 
-        # Optional Tukey taper (broadcast per axis, no full 2-D window needed)
+        # Copy only if the taper will modify the array in place
+        data = self.dfdas.to_numpy().astype(dtype, copy=taper is not None)
+        nt, nx = data.shape                 # actual shape, not stale meta
+
         if taper is not None:
             a_t, a_x = (taper, taper) if np.isscalar(taper) else taper
             for a in (a_t, a_x):
                 if a is not None and not 0 <= a <= 1:
                     raise ValueError(f"Tukey alpha must be in [0, 1], got {a}.")
-            data = data.astype(np.float32, copy=True)
             if a_t:
-                data *= sps.windows.tukey(nt, alpha=a_t).astype(np.float32)[:, None]
+                data *= sps.windows.tukey(nt, alpha=a_t).astype(dtype)[:, None]
             if a_x:
-                data *= sps.windows.tukey(nx, alpha=a_x).astype(np.float32)[None, :]
+                data *= sps.windows.tukey(nx, alpha=a_x).astype(dtype)[None, :]
 
-        # Real FFT along time (non-negative f only), full FFT along space.
-        # The mask depends on |f| and |k|, so this is equivalent to fft2.
-        spec = np.fft.fft(np.fft.rfft(data, axis=0), axis=1)
+        # Real FFT along time (axis 0), full FFT along space (axis 1).
+        # axes=(1, 0): the real transform runs over the last listed axis.
+        spec = sfft.rfft2(data, axes=(1, 0), workers=-1)       # (nt//2+1, nx)
+        del data
 
-        f = np.fft.rfftfreq(nt, d=dt)[:, None]  # (nt//2+1, 1)
-        k = np.abs(np.fft.fftfreq(nx, d=dx))[None, :]  # (1, nx)
+        f = sfft.rfftfreq(nt, d=dt).astype(dtype)[:, None]      # (nt//2+1, 1)
+        k = np.abs(sfft.fftfreq(nx, d=dx)).astype(dtype)[None, :]  # (1, nx)
 
-        # Velocity test written without dividing by k (no 1e-10 hack needed)
+        # Velocity test without dividing by k: |f/k| >= vmin  <=>  f >= vmin*k
         mask = f >= vmin * k
         if vmax is not None:
             mask &= f <= vmax * k
-        mask = mask.astype(np.float32)
 
-        # Taper the mask edges to reduce ringing. Frequency axis is not periodic
-        # (rfft layout), wavenumber axis is (unshifted fft layout).
-        mask = ndimage.gaussian_filter(mask, sigma=sigma, mode=("nearest", "wrap"))
+        # Smooth the mask edges to reduce ringing. The mask depends on |f|, so a
+        # blur over the full f-k plane would see values mirrored about f=0:
+        # "mirror" on the frequency axis reproduces that exactly (even nt; for
+        # odd nt the top rows differ by <3e-3). The wavenumber axis is periodic.
+        mask = ndimage.gaussian_filter(mask.astype(dtype), sigma=sigma,
+                                       mode=("mirror", "wrap"))
+        spec *= mask
+        del mask
 
-        out = np.fft.irfft(np.fft.ifft(spec * mask, axis=1), n=nt, axis=0)
+        out = sfft.irfft2(spec, s=(nx, nt), axes=(1, 0), workers=-1)   # (nt, nx), real
 
         self.dfdas = DASDataFrame(
             out,
@@ -3498,12 +3527,8 @@ class DASProcessor:
             columns=self.dfdas.columns,
             meta=self.dfdas.meta.copy(),
         )
-
-        if self.mseed_stream is not None:
-            self.mseed_stream = self.dfdas_to_mseed(self.event)   # update mseed stream to match the data
-            logging.info("FK filter applied and mseed stream updated.")
-        
-        return self.dfdas, self.mseed_stream
+        self.mseed_stream = None   # cached stream no longer matches the data
+        return self.dfdas
 
     def plot_record_sections(self, dataset=None, event=None, suffix=""):
         # Use class attributes for configuration to integrate with DASProcessor
@@ -3851,6 +3876,340 @@ class DASProcessor:
         print(f'Interspace spacing={st_every_other[1].stats.distance-st_every_other[0].stats.distance} from {st_every_other[0].stats.distance} to {st_every_other[-1].stats.distance}. {len(st_every_other)} traces.')
         print("Finished plotting record section.")
 
+    @staticmethod
+    def _whale_bandpass(x, fs, lo, hi, order=4):
+        from scipy.signal import butter, filtfilt
+
+        nyq = 0.5 * fs
+        lo = max(0.001, float(lo))
+        hi = min(float(hi), nyq * 0.99)
+        b, a = butter(order, [lo / nyq, hi / nyq], btype="band")
+        return filtfilt(b, a, x)
+
+    @staticmethod
+    def _whale_rms(x):
+        x = np.asarray(x, dtype=float)
+        return np.sqrt(np.mean(x**2))
+
+    @staticmethod
+    def _whale_print_stats(name, values, fmt="{:.3f}"):
+        values = np.asarray(values, dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            print(f"{name} Mean:    n/a")
+            print(f"{name} Median:  n/a")
+            print(f"{name} Std:     n/a")
+            print(f"{name} min:     n/a")
+            print(f"{name} max:     n/a")
+            return
+        print(f"{name} Mean:    " + fmt.format(np.mean(values)))
+        print(f"{name} Median:  " + fmt.format(np.median(values)))
+        print(f"{name} Std:     " + fmt.format(np.std(values)))
+        print(f"{name} min:     " + fmt.format(np.min(values)))
+        print(f"{name} max:     " + fmt.format(np.max(values)))
+
+    @staticmethod
+    def _whale_centers_to_edges(c, start=None, end=None):
+        c = np.asarray(c, dtype=float)
+        if len(c) == 1:
+            if start is None:
+                start = c[0] - 0.5
+            if end is None:
+                end = c[0] + 0.5
+            return np.array([start, end], dtype=float)
+
+        edges = np.empty(len(c) + 1, dtype=float)
+        edges[1:-1] = 0.5 * (c[:-1] + c[1:])
+        if start is None:
+            start = c[0] - 0.5 * (c[1] - c[0])
+        if end is None:
+            end = c[-1] + 0.5 * (c[-1] - c[-2])
+        edges[0] = start
+        edges[-1] = end
+        return edges
+
+    def _prepare_whale_template(self, template, template_fs, fs, search_win_sec):
+        from scipy.signal import resample_poly
+
+        tpl = np.loadtxt(template).astype(np.float64)
+        tpl -= tpl.mean()
+        if template_fs != fs:
+            tpl = resample_poly(
+                tpl,
+                up=int(round(fs)),
+                down=int(round(template_fs))
+            ).astype(np.float64)
+            tpl -= tpl.mean()
+
+        n_tpl = len(tpl)
+        pulse_width = (n_tpl - 1) / fs
+        half_pulse_samp = int(round(0.5 * pulse_width * fs))
+        n_search_window = int(round(search_win_sec * fs))
+        tpl_plus = np.concatenate([np.zeros(n_tpl), tpl, np.zeros(n_tpl)])
+        return tpl, tpl_plus, n_tpl, half_pulse_samp, n_search_window
+
+    def _whale_auto_choose_channel(self, stream, band_detect):
+        peaks = []
+        for tr in stream:
+            x_raw = tr.data.astype(np.float64)
+            fs = float(tr.stats.sampling_rate)
+            x_det = self._whale_bandpass(x_raw, fs, *band_detect)
+            peaks.append(np.nanmax(np.abs(x_det)))
+        return int(np.nanargmax(peaks))
+
+    def _setup_whale_detection(self, event, species, template, template_fs):
+        if self.mseed_stream is None or len(self.mseed_stream) == 0:
+            logging.info("Stream  is empty.")
+            self.mseed_stream = self.dfdas_to_mseed(event, write=False)
+
+        if template is None and species is None:
+            logging.error("No template or species defined.")
+            logging.info("Please check the input parameters and try again.")
+            raise ValueError("No template or species defined.")
+
+        if template is None:
+            species_lower = species.lower()
+            if species_lower in ("blue", "fin", "humpback", "sei", "minke"):
+                template = f"{species_lower.upper()}_{template_fs}Hz.txt"
+            else:
+                logging.error(f"Unknown species: {species}")
+                logging.info("Please check the species name and try again.")
+                raise ValueError(f"Unknown species: {species}")
+
+        if not os.path.exists(template):
+            logging.error(f"Template file {template} not found")
+            logging.info("Please check the file path and try again.")
+            init_whale_templates()
+            raise FileNotFoundError(
+                f"Template file {template} not found. Default templates have been initialized in the current directory.\n"
+                "Please check the file path and try again."
+            )
+        return template
+
+    def _select_whale_indices(self, stream, detection_mode, channel_idx, band_detect):
+        if detection_mode not in ("single", "auto", "all"):
+            raise ValueError("DETECTION_MODE must be 'single', 'auto', or 'all'")
+        if detection_mode == "single":
+            if channel_idx is None:
+                raise ValueError("Set CHANNEL_IDX when DETECTION_MODE = 'single'")
+            if channel_idx < 0 or channel_idx >= len(stream):
+                raise IndexError(f"CHANNEL_IDX out of range: {channel_idx}")
+            return [channel_idx]
+        if detection_mode == "auto":
+            return [self._whale_auto_choose_channel(stream, band_detect)]
+        return list(range(len(stream)))
+
+    def _process_whale_trace(self, tr, idx, template, template_fs, band_detect,
+                             env_win, thresh, min_dist, search_win_sec, corr_thresh):
+        from scipy.signal import find_peaks
+        from obspy.signal.cross_correlation import correlate as obspy_cc
+        from datetime import timedelta
+
+        x_raw = tr.data.astype(np.float64)
+        fs = float(tr.stats.sampling_rate)
+        start_time = tr.stats.starttime.datetime
+        station = getattr(tr.stats, "station", "")
+        channel_label = station if station else f"channel_{idx}"
+
+        tpl, tpl_plus, n_tpl, half_pulse_samp, n_search_window = \
+            self._prepare_whale_template(template, template_fs, fs, search_win_sec)
+        x_det = self._whale_bandpass(x_raw, fs, *band_detect)
+        env = np.abs(x_det)
+        win_n = max(1, int(env_win * fs))
+        amp_smooth = np.convolve(env, np.ones(win_n) / win_n, mode="same")
+        thr = thresh * np.median(env)
+        dist = max(1, int(min_dist * fs))
+        raw_picks, _ = find_peaks(amp_smooth, height=thr, distance=dist)
+
+        results = []
+        for p in raw_picks:
+            approx_start = max(0, p - half_pulse_samp)
+            i0 = approx_start - n_tpl
+            i1 = approx_start + 2 * n_tpl
+            if i0 < 0 or i1 > len(x_det):
+                continue
+            st2 = x_det[i0:i1]
+            if len(st2) != len(tpl_plus):
+                continue
+
+            cc = obspy_cc(st2, tpl_plus, n_search_window,
+                          normalize="naive", method="direct", demean=True)
+            i_max = int(np.argmax(cc))
+            master_corr = float(np.max(cc))
+            master_shift = (i_max - n_search_window) / fs
+            if master_corr < corr_thresh:
+                continue
+
+            refined_start = approx_start + (i_max - n_search_window)
+            sig0 = refined_start
+            sig1 = refined_start + n_tpl
+            noi0 = refined_start - n_tpl
+            noi1 = refined_start
+            if noi0 < 0 or sig1 > len(x_det):
+                continue
+
+            signal_win = x_det[sig0:sig1]
+            noise_win = x_det[noi0:noi1]
+            amp_max = float(np.max(np.abs(signal_win)))
+            signal_rms = float(self._whale_rms(signal_win))
+            noise_rms = float(self._whale_rms(noise_win))
+            snr = np.nan if noise_rms == 0 else signal_rms / noise_rms
+            tsec = refined_start / fs
+            abs_time = start_time + timedelta(seconds=float(tsec))
+            results.append({
+                "sample": int(refined_start),
+                "time_s": float(tsec),
+                "datetime": abs_time,
+                "corr": float(master_corr),
+                "shift_s": float(master_shift),
+                "amp_max": float(amp_max),
+                "signal_rms": float(signal_rms),
+                "noise_rms": float(noise_rms),
+                "snr": float(snr),
+            })
+
+        return {
+            "idx": idx, "label": channel_label, "fs": fs,
+            "start_time": start_time, "x_raw": x_raw, "x_det": x_det,
+            "amp_smooth": amp_smooth, "thr": thr,
+            "raw_picks": raw_picks, "results": results,
+        }
+
+    @staticmethod
+    def _choose_whale_plot_result(processed):
+        if len(processed) == 1:
+            return processed[0]
+        kept_counts = [len(p["results"]) for p in processed]
+        if np.max(kept_counts) > 0:
+            return processed[int(np.argmax(kept_counts))]
+        raw_counts = [len(p["raw_picks"]) for p in processed]
+        return processed[int(np.argmax(raw_counts))]
+
+    def _report_whale_detections(self, detection_mode, processed, all_results,
+                                 band_detect, env_win):
+        if detection_mode in ("single", "auto"):
+            p = processed[0]
+            print(f"Detection mode       : {detection_mode}")
+            print(f"Chosen channel index : {p['idx']}")
+            print(f"Chosen channel label : {p['label']}")
+            print(f"Sampling rate        : {p['fs']:.1f} Hz")
+            print(f"Frequency BW         : {band_detect} Hz")
+            print(f"ENV_WIN              : {env_win} s")
+            print(f"Raw picks            : {len(p['raw_picks'])}")
+            print(f"Kept detections      : {len(p['results'])}")
+
+            for i, rec in enumerate(p["results"], start=1):
+                print(
+                    f"{i:02d} | t = {rec['time_s']:7.2f} s | {rec['datetime']} | "
+                    f"Cmax = {rec['corr']:.3f} | Shift = {rec['shift_s']:.3f} s | "
+                    f"Amp = {rec['amp_max']:.3f} | Signal RMS = {rec['signal_rms']:.3f} | "
+                    f"Noise RMS = {rec['noise_rms']:.3f} | SNR = {rec['snr']:.2f}"
+                )
+        else:
+            print(f"Detection mode       : {detection_mode}")
+            print(f"Processed channels   : {len(processed)}")
+            print(f"Frequency BW         : {band_detect} Hz")
+            print(f"ENV_WIN              : {env_win} s")
+            print()
+
+            nonzero = [
+                p for p in processed
+                if len(p["raw_picks"]) > 0 or len(p["results"]) > 0
+            ]
+            print(f"Channels with picks  : {len(nonzero)}")
+            print(f"Total kept detections: {len(all_results)}")
+            print()
+            for p in nonzero:
+                print(
+                    f"idx={p['idx']:5d} | label={p['label']} | "
+                    f"raw={len(p['raw_picks']):3d} | kept={len(p['results']):3d}"
+                )
+
+        print("*******************************")
+        print(f"Number of lines found {len(all_results)}")
+        if len(all_results) > 0:
+            cmax_arr = [r["corr"] for r in all_results]
+            shift_arr = [r["shift_s"] for r in all_results]
+            snr_arr = [r["snr"] for r in all_results]
+
+            self._whale_print_stats("Cmax", cmax_arr, "{:.3f}")
+            print()
+            self._whale_print_stats("Shift", shift_arr, "{:.3f}")
+            print()
+            self._whale_print_stats("SNR", snr_arr, "{:.3f}")
+
+    def _plot_whale_detections(self, plot_result, spec_source, spec_fmin,
+                               spec_fmax, spec_nperseg, spec_noverlap,
+                               spec_nfft, spec_dr, cmap):
+        from scipy.signal import spectrogram
+
+        picks = np.array(
+            [rec["sample"] for rec in plot_result["results"]], dtype=int
+        )
+        raw_picks = plot_result["raw_picks"]
+        amp_smooth = plot_result["amp_smooth"]
+        thr = plot_result["thr"]
+        fs = plot_result["fs"]
+        x_raw = plot_result["x_raw"]
+        x_det = plot_result["x_det"]
+        channel_label = plot_result["label"]
+        channel_idx = plot_result["idx"]
+        start_time = plot_result["start_time"]
+
+        t = np.arange(len(amp_smooth)) / fs
+        x_spec = x_raw if spec_source == "raw" else x_det
+        f, tt, Sxx = spectrogram(
+            x_spec, fs=fs, window="hann", nperseg=spec_nperseg,
+            noverlap=spec_noverlap, nfft=spec_nfft, detrend=False,
+            scaling="spectrum", mode="magnitude"
+        )
+        Sxx_db = 20 * np.log10(Sxx + 1e-12)
+        sel = (f >= spec_fmin) & (f <= spec_fmax)
+        duration = len(x_spec) / fs
+        t_edges = self._whale_centers_to_edges(tt, start=0.0, end=duration)
+        f_sel = f[sel]
+        f_edges = self._whale_centers_to_edges(f_sel)
+        vmax = np.percentile(Sxx_db[sel, :], 99.9)
+        vmin = vmax - spec_dr
+
+        fig, (ax0, ax1) = plt.subplots(
+            2, 1, figsize=(12, 6), sharex=True,
+            gridspec_kw={"height_ratios": [1, 2]}
+        )
+        fig.subplots_adjust(right=0.80, hspace=0.10)
+        ax0.plot(t, amp_smooth, lw=1.0, color="black",
+                 label="Smoothed amplitude")
+        ax0.axhline(thr, color="red", ls="--", lw=1.0,
+                    label="Amplitude threshold")
+        if len(raw_picks):
+            ax0.plot(
+                raw_picks / fs, amp_smooth[raw_picks],
+                "o", ms=4, mfc="none", mec="orange", label="Raw picks"
+            )
+        ax0.set_ylabel("Amplitude")
+        ax0.set_title(
+            f"Channel {channel_idx} ({channel_label}) | start = {start_time}"
+        )
+        ax0.set_xlim(0, duration)
+        ax0.legend(
+            loc="upper left", bbox_to_anchor=(1.01, 1.0),
+            borderaxespad=0.0, frameon=False
+        )
+        ax1.pcolormesh(
+            t_edges, f_edges, Sxx_db[sel, :],
+            shading="flat", cmap=cmap, vmin=vmin, vmax=vmax
+        )
+        ax1.set_ylim(spec_fmin, spec_fmax)
+        ax1.set_xlim(0, duration)
+        ax1.set_ylabel("Frequency (Hz)")
+        ax1.set_xlabel("Time (s)")
+        for p in picks:
+            ax1.axvline(p / fs, color="white", ls="--", lw=1.0, alpha=0.9)
+        plt.setp(ax0.get_xticklabels(), visible=False)
+        plt.savefig("Whale_detector.png", bbox_inches="tight", pad_inches=0)
+        plt.show()
+        plt.close()
+
     def baleen_whale_detector(self, event, species=None, template=None, template_fs=100, detection_mode='single', channel_idx=None,\
                               band_detect=(15,25), env_win=0.2, thresh=4.5, min_dist= 8.0, search_win_sec= 1.0, corr_thresh= 0.15,\
                               spec_source="raw", spec_fmin=10, spec_fmax=40, spec_nperseg=1042, spec_noverlap=900, spec_nfft=2048,\
@@ -3938,279 +4297,21 @@ class DASProcessor:
             FileNotFoundError: If the selected template file does not exist.
             IndexError: If ``channel_idx`` is outside the stream.
         """
-        from scipy.signal import butter, filtfilt, find_peaks, spectrogram, resample_poly
-        from obspy.signal.cross_correlation import correlate as obspy_cc
-        from datetime import timedelta
+        template = self._setup_whale_detection(event, species, template, template_fs)
 
-        # --- GENERAL FUNCTIONS
-        # ---------------------------------------------------------------------------
-        def bandpass(x, fs, lo, hi, order=4):
-            nyq = 0.5 * fs
-            lo = max(0.001, float(lo))
-            hi = min(float(hi), nyq * 0.99)
-            b, a = butter(order, [lo / nyq, hi / nyq], btype="band")
-            return filtfilt(b, a, x)
+        process_indices = self._select_whale_indices(
+            self.mseed_stream, detection_mode, channel_idx, band_detect
+        )
 
-        def rms(x):
-            x = np.asarray(x, dtype=float)
-            return np.sqrt(np.mean(x**2))
-
-        def print_stats(name, values, fmt="{:.3f}"):
-            values = np.asarray(values, dtype=float)
-            values = values[np.isfinite(values)]
-            if values.size == 0:
-                print(f"{name} Mean:    n/a")
-                print(f"{name} Median:  n/a")
-                print(f"{name} Std:     n/a")
-                print(f"{name} min:     n/a")
-                print(f"{name} max:     n/a")
-                return
-            print(f"{name} Mean:    " + fmt.format(np.mean(values)))
-            print(f"{name} Median:  " + fmt.format(np.median(values)))
-            print(f"{name} Std:     " + fmt.format(np.std(values)))
-            print(f"{name} min:     " + fmt.format(np.min(values)))
-            print(f"{name} max:     " + fmt.format(np.max(values)))
-
-        def centers_to_edges(c, start=None, end=None):
-            c = np.asarray(c, dtype=float)
-            if len(c) == 1:
-                if start is None:
-                    start = c[0] - 0.5
-                if end is None:
-                    end = c[0] + 0.5
-                return np.array([start, end], dtype=float)
-
-            edges = np.empty(len(c) + 1, dtype=float)
-            edges[1:-1] = 0.5 * (c[:-1] + c[1:])
-
-            if start is None:
-                start = c[0] - 0.5 * (c[1] - c[0])
-            if end is None:
-                end = c[-1] + 0.5 * (c[-1] - c[-2])
-
-            edges[0] = start
-            edges[-1] = end
-            return edges
-
-        def trace_label(tr, idx):
-            station = getattr(tr.stats, "station", "")
-            if station:
-                return station
-            return f"channel_{idx}"
-
-        def prepare_template(fs):
-            tpl = np.loadtxt(template).astype(np.float64)
-            tpl -= tpl.mean()
-
-            if template_fs != fs:
-                tpl = resample_poly(
-                    tpl,
-                    up=int(round(fs)),
-                    down=int(round(template_fs))
-                ).astype(np.float64)
-                tpl -= tpl.mean()
-
-            n_tpl = len(tpl)
-            pulse_width = (n_tpl - 1) / fs
-            half_pulse_samp = int(round(0.5 * pulse_width * fs))
-            n_search_window = int(round(search_win_sec * fs))
-
-            # zero + master + zero
-            tpl_plus = np.concatenate([np.zeros(n_tpl), tpl, np.zeros(n_tpl)])
-
-            return tpl, tpl_plus, n_tpl, half_pulse_samp, n_search_window
-
-        def auto_choose_channel(stream):
-            peaks = []
-            for i, tr in enumerate(stream):
-                x_raw = tr.data.astype(np.float64)
-                fs = float(tr.stats.sampling_rate)
-                x_det = bandpass(x_raw, fs, *band_detect)
-                peaks.append(np.nanmax(np.abs(x_det)))
-            return int(np.nanargmax(peaks))
-
-        def process_trace(tr, idx):
-            x_raw = tr.data.astype(np.float64)
-            fs = float(tr.stats.sampling_rate)
-            start_time = tr.stats.starttime.datetime
-            channel_label = trace_label(tr, idx)
-
-            tpl, tpl_plus, n_tpl, half_pulse_samp, n_search_window = prepare_template(fs)
-
-            # Detection trace
-            x_det = bandpass(x_raw, fs, * band_detect)
-
-            env = np.abs(x_det)
-
-            win_n = max(1, int(env_win * fs))
-            amp_smooth = np.convolve(env, np.ones(win_n) / win_n, mode="same")
-
-            thr = thresh * np.median(env)
-            dist = max(1, int(min_dist * fs))
-
-            raw_picks, _ = find_peaks(
-                amp_smooth,
-                height=thr,
-                distance=dist
-            )
-
-            results = []
-
-            for p in raw_picks:
-                approx_start = max(0, p - half_pulse_samp)
-
-                i0 = approx_start - n_tpl
-                i1 = approx_start + 2 * n_tpl
-
-                if i0 < 0 or i1 > len(x_det):
-                    continue
-                
-                st2 = x_det[i0:i1]
-
-                if len(st2) != len(tpl_plus):
-                    continue
-                
-                cc = obspy_cc(
-                    st2,
-                    tpl_plus,
-                    n_search_window,
-                    normalize="naive",
-                    method="direct",
-                    demean=True
-                )
-
-                i_max = int(np.argmax(cc))
-                master_corr = float(np.max(cc))
-                master_shift = (i_max - n_search_window) / fs
-
-                if master_corr < corr_thresh:
-                    continue
-                
-                refined_start = approx_start + (i_max - n_search_window)
-
-                sig0 = refined_start
-                sig1 = refined_start + n_tpl
-                noi0 = refined_start - n_tpl
-                noi1 = refined_start
-
-                if noi0 < 0 or sig1 > len(x_det):
-                    continue
-                
-                signal_win = x_det[sig0:sig1]
-                noise_win = x_det[noi0:noi1]
-
-                amp_max = float(np.max(np.abs(signal_win)))
-                signal_rms = float(rms(signal_win))
-                noise_rms = float(rms(noise_win))
-                snr = np.nan if noise_rms == 0 else signal_rms / noise_rms
-
-                tsec = refined_start / fs
-                abs_time = start_time + timedelta(seconds=float(tsec))
-
-                results.append({
-                    "sample": int(refined_start),
-                    "time_s": float(tsec),
-                    "datetime": abs_time,
-                    "corr": float(master_corr),
-                    "shift_s": float(master_shift),
-                    "amp_max": float(amp_max),
-                    "signal_rms": float(signal_rms),
-                    "noise_rms": float(noise_rms),
-                    "snr": float(snr),
-                })
-
-            return {
-                "idx": idx,
-                "label": channel_label,
-                "fs": fs,
-                "start_time": start_time,
-                "x_raw": x_raw,
-                "x_det": x_det,
-                "amp_smooth": amp_smooth,
-                "thr": thr,
-                "raw_picks": raw_picks,
-                "results": results,
-            }
-
-        def choose_plot_result(processed):
-            if len(processed) == 1:
-                return processed[0]
-
-            # Prefer the channel with the most kept detections
-            kept_counts = [len(p["results"]) for p in processed]
-            if np.max(kept_counts) > 0:
-                return processed[int(np.argmax(kept_counts))]
-
-            # If none kept, use the one with most raw picks
-            raw_counts = [len(p["raw_picks"]) for p in processed]
-            return processed[int(np.argmax(raw_counts))]
-
-
-
-        # --- BASIC CHECKS
-        # ---------------------------------------------------------------------------
-        if self.mseed_stream==None or len(self.mseed_stream) == 0:
-            logging.info("Stream  is empty.")
-            self.mseed_stream = self.dfdas_to_mseed(event, write=False)
-
-        if template is None and species is None:
-            logging.error(f"No template or species defined.")
-            logging.info(f"Please check the input parameters and try again.")
-            raise ValueError(f"No template or species defined.")
-
-        if template is None:
-            match species.lower():
-                case "blue":
-                    template = f"BLUE_{template_fs}Hz.txt"
-                case "fin":
-                    template = f"FIN_{template_fs}Hz.txt"
-                case "humpback":
-                    template = f"HUMPBACK_{template_fs}Hz.txt"
-                case "sei":
-                    template = f"SEI_{template_fs}Hz.txt"
-                case "minke":
-                    template = f"MINKE_{template_fs}Hz.txt"
-                case _:
-                    logging.error(f"Unknown species: {species}")
-                    logging.info(f"Please check the species name and try again.")
-                    raise ValueError(f"Unknown species: {species}")
-
-        if not os.path.exists(template):
-            logging.error(f"Template file {template} not found")
-            logging.info(f"Please check the file path and try again.")
-            init_whale_templates()
-            raise FileNotFoundError(f"Template file {template} not found. Default templates have been initialized in the current directory.\nPlease check the file path and try again.")
-
-        # --- CHANNEL SELECTION
-        # ---------------------------------------------------------------------------
-        if detection_mode not in ("single", "auto", "all"):
-            raise ValueError("DETECTION_MODE must be 'single', 'auto', or 'all'")
-    
-        if detection_mode == "single":
-            if channel_idx is None:
-                raise ValueError("Set CHANNEL_IDX when DETECTION_MODE = 'single'")
-            if channel_idx < 0 or channel_idx >= len(self.mseed_stream):
-                raise IndexError(f"CHANNEL_IDX out of range: {channel_idx}")
-            process_indices = [channel_idx]
-    
-        elif detection_mode == "auto":
-            auto_idx = auto_choose_channel(self.mseed_stream)
-            process_indices = [auto_idx]
-    
-        else:  # detection_mode == "all"
-            process_indices = list(range(len(self.mseed_stream)))
-    
-    
-        # --- RUN DETECTOR
-        # ---------------------------------------------------------------------------
         processed = []
         for idx in process_indices:
-            processed.append(process_trace(self.mseed_stream[idx], idx))
-    
-        # Channel used for plotting
-        plot_result = choose_plot_result(processed)
-    
-        # Flatten all kept detections for global summary
+            processed.append(self._process_whale_trace(
+                self.mseed_stream[idx], idx, template, template_fs, band_detect,
+                env_win, thresh, min_dist, search_win_sec, corr_thresh
+            ))
+
+        plot_result = self._choose_whale_plot_result(processed)
+
         all_results = []
         for p in processed:
             for rec in p["results"]:
@@ -4218,157 +4319,14 @@ class DASProcessor:
                 rec2["channel_idx"] = p["idx"]
                 rec2["channel_label"] = p["label"]
                 all_results.append(rec2)
-    
-    
-        # --- OUTPUT
-        # ---------------------------------------------------------------------------
-        if detection_mode in ("single", "auto"):
-            p = processed[0]
-            print(f"Detection mode       : {detection_mode}")
-            print(f"Chosen channel index : {p['idx']}")
-            print(f"Chosen channel label : {p['label']}")
-            print(f"Sampling rate        : {p['fs']:.1f} Hz")
-            print(f"Frequency BW         : {band_detect} Hz")
-            print(f"ENV_WIN              : {env_win} s")
-            print(f"Raw picks            : {len(p['raw_picks'])}")
-            print(f"Kept detections      : {len(p['results'])}")
-    
-            for i, rec in enumerate(p["results"], start=1):
-                print(
-                    f"{i:02d} | t = {rec['time_s']:7.2f} s | {rec['datetime']} | "
-                    f"Cmax = {rec['corr']:.3f} | Shift = {rec['shift_s']:.3f} s | "
-                    f"Amp = {rec['amp_max']:.3f} | Signal RMS = {rec['signal_rms']:.3f} | "
-                    f"Noise RMS = {rec['noise_rms']:.3f} | SNR = {rec['snr']:.2f}"
-                )
-    
-        else:
-            print(f"Detection mode       : {detection_mode}")
-            print(f"Processed channels   : {len(processed)}")
-            print(f"Frequency BW         : {band_detect} Hz")
-            print(f"ENV_WIN              : {env_win} s")
-            print()
-    
-            nonzero = [p for p in processed if (len(p["raw_picks"]) > 0 or len(p["results"]) > 0)]
-            print(f"Channels with picks  : {len(nonzero)}")
-            print(f"Total kept detections: {len(all_results)}")
-            print()
-    
-            # Print concise summary only for channels with at least one raw or kept detection
-            for p in nonzero:
-                print(
-                    f"idx={p['idx']:5d} | label={p['label']} | "
-                    f"raw={len(p['raw_picks']):3d} | kept={len(p['results']):3d}"
-                )
-    
-        # --- SUMMARY STATS
-        print("*******************************")
-        print(f"Number of lines found {len(all_results)}")
-    
-        if len(all_results) > 0:
-            cmax_arr = [r["corr"] for r in all_results]
-            shift_arr = [r["shift_s"] for r in all_results]
-            snr_arr = [r["snr"] for r in all_results]
-    
-            print_stats("Cmax", cmax_arr, "{:.3f}")
-            print()
-            print_stats("Shift", shift_arr, "{:.3f}")
-            print()
-            print_stats("SNR", snr_arr, "{:.3f}")
-    
-    
-        # --- PLOT: DETECTION RESULTS + SPECTROGRAM
-        # ---------------------------------------------------------------------------
-        picks = np.array([rec["sample"] for rec in plot_result["results"]], dtype=int)
-        raw_picks = plot_result["raw_picks"]
-        amp_smooth = plot_result["amp_smooth"]
-        thr = plot_result["thr"]
-        fs = plot_result["fs"]
-        x_raw = plot_result["x_raw"]
-        x_det = plot_result["x_det"]
-        channel_label = plot_result["label"]
-        channel_idx = plot_result["idx"]
-        start_time = plot_result["start_time"]
-    
-        t = np.arange(len(amp_smooth)) / fs
-        x_spec = x_raw if spec_source == "raw" else x_det
-    
-        f, tt, Sxx = spectrogram(
-            x_spec,
-            fs=fs,
-            window="hann",
-            nperseg=spec_nperseg,
-            noverlap=spec_noverlap,
-            nfft=spec_nfft,
-            detrend=False,
-            scaling="spectrum",
-            mode="magnitude"
+
+        self._report_whale_detections(
+            detection_mode, processed, all_results, band_detect, env_win
         )
-    
-        Sxx_db = 20 * np.log10(Sxx + 1e-12)
-        sel = (f >= spec_fmin) & (f <= spec_fmax)
-    
-        duration = len(x_spec) / fs
-        t_edges = centers_to_edges(tt, start=0.0, end=duration)
-        f_sel = f[sel]
-        f_edges = centers_to_edges(f_sel)
-    
-        vmax = np.percentile(Sxx_db[sel, :], 99.9)
-        vmin = vmax - spec_dr
-    
-        fig, (ax0, ax1) = plt.subplots(
-            2, 1, figsize=(12, 6), sharex=True,
-            gridspec_kw={"height_ratios": [1, 2]}
+        self._plot_whale_detections(
+            plot_result, spec_source, spec_fmin, spec_fmax, spec_nperseg,
+            spec_noverlap, spec_nfft, spec_dr, cmap
         )
-        fig.subplots_adjust(right=0.80, hspace=0.10)
-    
-        # Top panel: smoothed amplitude
-        ax0.plot(t, amp_smooth, lw=1.0, color="black", label="Smoothed amplitude")
-        ax0.axhline(thr, color="red", ls="--", lw=1.0, label="Amplitude threshold")
-    
-        if len(raw_picks):
-            ax0.plot(
-                raw_picks / fs,
-                amp_smooth[raw_picks],
-                "o",
-                ms=4,
-                mfc="none",
-                mec="orange",
-                label="Raw picks"
-            )
-    
-        ax0.set_ylabel("Amplitude")
-        ax0.set_title(f"Channel {channel_idx} ({channel_label}) | start = {start_time}")
-        ax0.set_xlim(0, duration)
-        ax0.legend(
-            loc="upper left",
-            bbox_to_anchor=(1.01, 1.0),
-            borderaxespad=0.0,
-            frameon=False
-      )
-
-        # Bottom panel: spectrogram
-        ax1.pcolormesh(
-            t_edges,
-            f_edges,
-            Sxx_db[sel, :],
-            shading="flat",
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax
-        )
-
-        ax1.set_ylim(spec_fmin, spec_fmax)
-        ax1.set_xlim(0, duration)
-        ax1.set_ylabel("Frequency (Hz)")
-        ax1.set_xlabel("Time (s)")
-
-        for p in picks:
-            ax1.axvline(p / fs, color="white", ls="--", lw=1.0, alpha=0.9)
-
-        plt.setp(ax0.get_xticklabels(), visible=False)
-        plt.savefig('Whale_detector.png', bbox_inches='tight', pad_inches=0)
-        plt.show()
-        plt.close()
 
         return all_results
 
@@ -4409,44 +4367,102 @@ def get_travel_times(event,global_params,rec_lat,rec_lon):
 
     return arrivals_p, arrivals_s
 
-def get_coordinates(channel, global_params,roi_channel=False):
+@functools.lru_cache(maxsize=8)
+def _load_coords_table(csv_path, mtime_ns):
     """
-    Get coordinates (latitude, longitude, elevation) based on the provided channel
+    Read the coordinates CSV once and index it by channel.
+
+    Cached on (path, modification time), so editing the file is picked up
+    automatically. Returns {"CHANNEL": {channel: row_dict}, "ROI_CHANNEL": {...}};
+    only keys whose column exists in the CSV are present. When a channel
+    appears more than once the first row wins, as with the old
+    df.loc[...].values[0].
+    """
+    df = pd.read_csv(csv_path)
+    tables = {}
+    for key in ("CHANNEL", "ROI_CHANNEL"):
+        if key in df.columns:
+            tables[key] = (df.drop_duplicates(subset=key, keep="first")
+                             .set_index(key).to_dict("index"))
+    return tables
+
+
+def clear_coords_cache():
+    """Force the next lookup to re-read the coordinates CSV."""
+    _load_coords_table.cache_clear()
+
+
+def _coords_row(channel, global_params, roi_channel=False):
+    """Row dict for `channel` from the cached coordinates table, or None."""
+    pp = global_params['path_params']
+    csv_path = os.path.join(pp['coords_path'], pp['coords_DAS'])
+    tables = _load_coords_table(csv_path, os.stat(csv_path).st_mtime_ns)
+    key = 'ROI_CHANNEL' if roi_channel else 'CHANNEL'
+    if key not in tables:
+        raise KeyError(key)
+    return tables[key].get(channel)
+
+
+def get_coordinates(channel, global_params, roi_channel=False, strict=False):
+    """
+    Get coordinates (latitude, longitude, elevation) based on the provided channel.
+    The CSV is read once and cached (see _load_coords_table).
 
     Parameters:
     - channel (int): The channel number for which coordinates are needed.
-    - coords_path (str): The path to the CSV file.
-    - coords_DAS (str): The name of the CSV file.
+    - global_params: dictionary with 'exec_params' and 'path_params'
+      (coords_path, coords_DAS locate the CSV file).
+    - roi_channel (bool): look the channel up in ROI_CHANNEL instead of CHANNEL.
+    - strict (bool): raise KeyError for an unknown channel instead of returning
+      the hardcoded default position (32.64441, -16.94396, 20).
 
     Returns:
-    Tuple (float, float, float): A tuple containing latitude, longitude, and elevation.
+    Tuple (float, float, float): latitude, longitude, elevation.
     """
     ep, pp = global_params['exec_params'], global_params['path_params']
-    
+
     if ep.get("verbose", False) == 2:
         print(f"Getting coordinates for channel {channel} from {pp['coords_path']}{pp['coords_DAS']}")
-        
-    df = pd.read_csv(os.path.join(pp['coords_path'],pp['coords_DAS']))
 
-    if roi_channel:
-        filtered_df = df.loc[df['ROI_CHANNEL'] == channel]
-    else:
-        filtered_df = df.loc[df['CHANNEL'] == channel]
+    row = _coords_row(channel, global_params, roi_channel)
 
-    if len(filtered_df) == 0:
-        logging.warning(f"No coordinates found for channel {channel}. Using default coordinates.")
-        if ep.get("verbose"):
-            print(f"No coordinates found for channel {channel}. Using default coordinates.")
-        from defaults import default_cable_coordinates
-        lat=default_cable_coordinates['latitude']
-        lon=default_cable_coordinates['longitude']
-        ele=default_cable_coordinates['elevation']
+    if row is None:
+        if strict:
+            raise KeyError(f"Channel {channel} not found in {pp['coords_DAS']}")
+        # Default position for unknown channels (kept for backward compatibility)
+        return 32.64441, -16.94396, 20
+
+    return row['LATITUDE'], row['LONGITUDE'], round(row['ALTITUDE'], 0)
+
+def get_azimuth_dip(channel, global_params, roi_channel=False):
+    """
+    Get azimuth and dip based on the provided channel.
+    The CSV is read once and cached (see _load_coords_table).
+
+    Parameters:
+    - channel (int): The channel number.
+    - global_params: dictionary with 'exec_params' and 'path_params'.
+    - roi_channel (bool): look the channel up in ROI_CHANNEL instead of CHANNEL.
+
+    Returns:
+    Tuple (float, float): azimuth (0-360) and dip. (0, 0) for an unknown channel.
+    """
+    ep, pp = global_params['exec_params'], global_params['path_params']
+
+    if ep.get("verbose", False) == 2:
+        print(f"Getting azimuth and dip for channel {channel} from {pp['coords_path']}{pp['coords_DAS']}")
+
+    row = _coords_row(channel, global_params, roi_channel)
+
+    if row is None:
+        azi, dip = 0, 0
     else:
-        lat=filtered_df['LATITUDE'].values[0]
-        lon=filtered_df['LONGITUDE'].values[0]
-        ele=round(filtered_df['ALTITUDE'].values[0],0)
-    
-    return lat,lon,ele
+        azi, dip = row['AZIMUTH'], row['DIP']
+
+    if azi < 0:
+        azi += 360
+
+    return azi, dip
 
 def encode_station_name(prefix,distance,global_params):
     """
@@ -4778,9 +4794,9 @@ def get_cheby2_coeffs(nyquist, freqmax):
         if order <= 12:
             break
         wp *= 0.99
-        order, wn = signal.cheb2ord(wp, ws, rp, rs, analog=0)
+        order, wn = sps.cheb2ord(wp, ws, rp, rs, analog=0)
 
-    b, a = signal.cheby2(order, rs, wn, btype="low", analog=0, output="ba")
+    b, a = sps.cheby2(order, rs, wn, btype="low", analog=0, output="ba")
     return b,a
 
 def zerophase_effective_fir(b, a, tol=1e-6, max_len=200_000):
@@ -4791,12 +4807,12 @@ def zerophase_effective_fir(b, a, tol=1e-6, max_len=200_000):
     """
     imp = np.zeros(max_len)
     imp[0] = 1.0
-    h = signal.lfilter(b, a, imp)
+    h = sps.lfilter(b, a, imp)
     big = np.nonzero(np.abs(h) > tol * np.max(np.abs(h)))[0]
     if big[-1] >= max_len - 1:
         raise ValueError("IIR impulse response did not decay within max_len samples")
     h = h[:big[-1] + 1]
-    return signal.fftconvolve(h, h[::-1])
+    return sps.fftconvolve(h, h[::-1])
 
 def zerophase_chebyshev_lowpass_filter(trace, freqmax):
         """
@@ -4813,44 +4829,7 @@ def zerophase_chebyshev_lowpass_filter(trace, freqmax):
         b, a = get_cheby2_coeffs(trace.stats.sampling_rate * 0.5, freqmax)
 
         # Apply twice to get rid of the phase distortion.
-        trace.data = signal.filtfilt(b, a, trace.data)
-
-
-def get_azimuth_dip(channel, global_params,roi_channel=False):
-    """
-    Get azimuth and dip based on the provided channel
-
-    Parameters:
-    - channel (int): The channel number for which coordinates are needed.
-    - coords_path (str): The path to the CSV file.
-    - coords_DAS (str): The name of the CSV file.
-
-    Returns:
-    Tuple (float, float): A tuple containing azimuth and dip.
-    """
-    ep, pp = global_params['exec_params'], global_params['path_params']
-
-    if ep.get("verbose", False) == 2:
-        print(f"Getting azimuth and dip for channel {channel} from {pp['coords_path']}{pp['coords_DAS']}")
-        
-    df = pd.read_csv(os.path.join(pp['coords_path'],pp['coords_DAS']))
-
-    if roi_channel:
-        filtered_df = df.loc[df['ROI_CHANNEL'] == channel]
-    else:
-        filtered_df = df.loc[df['CHANNEL'] == channel]
-    
-    if len(filtered_df) == 0:
-        azi=0
-        dip=0
-    else:
-        azi=filtered_df['AZIMUTH'].values[0]
-        dip=filtered_df['DIP'].values[0]
-    
-    if azi<0:
-        azi+=360
-
-    return azi,dip
+        trace.data = sps.filtfilt(b, a, trace.data)
 
 def get_data_from_S3(bucket_name, endpoint_url, starttime, endtime, local_path, unsigned=False):
     """
