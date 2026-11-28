@@ -1,63 +1,66 @@
-import inspect
+"""DAS processing pipeline: the ``DASProcessor`` class and ``process_events``.
+
+Supporting code lives in sibling modules (``das_io``, ``coords``, ``stationxml``, ``filters``,
+``scaling``, ``s3``, ``whale``, ``_log``). Their public names are re-exported here, so
+``from .das_processor import get_coordinates`` and similar imports keep working.
+"""
+from __future__ import annotations
+
+# --- Standard library --------------------------------------------------------
 import datetime
-import time
-import os
-import re
-import warnings
-import numpy as np
-from collections.abc import Iterable
-
-from sympy import symbols, sympify
-import builtins
-import math
-import h5py
-from h5py import Dataset, File, Group
-import pandas as pd
+import inspect
 import logging
-from pathlib import Path
-
+import os
+import subprocess
+import time
+import warnings
 from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
 
-from .config import init_whale_templates
-
-from obspy.core.util import AttribDict
-from obspy.taup import TauPyModel
-from obspy import UTCDateTime, read, Trace, Stream
-#from obspy.io.segy.segy import SUFile,SEGYTraceHeader, SEGYBinaryFileHeader
-#from obspy.io.segy.core import _read_segy
-from obspy.geodetics import degrees2kilometers,locations2degrees,gps2dist_azimuth
-from obspy.core.inventory import Inventory, Network, Station, Channel, Site,  Response, Equipment, Operator
-from obspy.core.inventory import InstrumentSensitivity, Person, PolesZerosResponseStage, CoefficientsTypeResponseStage
-
-from matplotlib import mlab
-
-import matplotlib.pyplot as plt
-import matplotlib.colors as colors
+# --- Third party -------------------------------------------------------------
+import h5py
 import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import scipy.fft as sfft
+import scipy.signal as sps
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Colormap, ListedColormap
 from matplotlib.dates import DateFormatter
 from matplotlib.gridspec import GridSpec
-from matplotlib.colors import ListedColormap # Normalize
-from matplotlib.patches import Patch #,ConnectionPatch, Normalize, Rectangle,Patch
-from matplotlib.collections import LineCollection
-
-import scipy.signal as sps
+from matplotlib.patches import Patch
+from obspy import read, Stream, Trace, UTCDateTime
+from obspy.core.util import AttribDict
+from obspy.geodetics import degrees2kilometers, gps2dist_azimuth, locations2degrees
+from obspy.taup import TauPyModel
 from scipy import ndimage
-from scipy.signal import hilbert, square, ShortTimeFFT
-from scipy.signal.windows import gaussian,hann
+from tqdm.auto import tqdm
 
-import functools
-import scipy.fft as sfft
+# --- Local -------------------------------------------------------------------
+# Names moved to sibling modules are re-exported here for backwards compatibility.
+from ._log import _setup_logging, TRACE
+from .coords import (  # noqa: F401
+    clear_coords_cache, degrade_coordinates, encode_station_name, get_azimuth_dip,
+    get_coordinates, get_travel_times,
+)
+from .das_io import (  # noqa: F401
+    convert_index_to_rel_time, create_time_axis, DASDataFrame, DictFile, find_DAS_files,
+    get_data_indexes, get_filemeta, load, load_DAS_files, load_keys, save, save_to_DAS_file,
+    str2datetime, unwrap, wrap,
+)
+from .filters import (  # noqa: F401
+    design_decimation_fir, get_cheby2_coeffs, zerophase_chebyshev_lowpass_filter,
+    zerophase_effective_fir,
+)
+from .s3 import get_data_from_S3  # noqa: F401
+from .scaling import check_int32_scaling, INT32_MAX, INT32_SCALES  # noqa: F401
+from .stationxml import station_xml_creation  # noqa: F401
+from .whale import detect_baleen_whales, DetectionParams, SpectrogramParams
 
-import subprocess
+logger = logging.getLogger(__name__)
 
-#check if code is running in jupyter
-if hasattr(builtins, "__IPYTHON__"):
-    from tqdm.notebook import tqdm
-    from ipywidgets import FloatProgress
-else:
-    from tqdm import tqdm
-
-_LOG_FILE = None
 
 # Colormaps whose midpoint is meaningful (zero for signed data).
 _DIVERGING_CMAPS = frozenset({
@@ -77,49 +80,13 @@ _NON_DIVERGING_CMAPS = frozenset({
     'twilight', 'twilight_shifted', 'hsv',
 })
 
-INT32_MAX = np.iinfo(np.int32).max
-# Scale applied to the data before int32 conversion, per resolution label.
-# This table must be the single source for BOTH dfdas_to_mseed (multiplier)
-# and the stage_gain written below. Keep only one definition in the module.
-INT32_SCALES = {"picostrain": 1e12, "nanostrain": 1e9, "microstrain": 1e6}
-
-# (stage name, output units, units description) for each resolution label
-_INT32_STAGE_TEXT = {
-    "picostrain": ("Picostrain to Counts Resolution Mapping", "PICOSTRAIN",
-                   "Picostrain units (1e-12 strain)"),
-    "nanostrain": ("Nanostrain to Counts Resolution Mapping", "NANOSTRAIN",
-                  "Nanostrain units (1e-9 strain)"),
-    "microstrain": ("Microstrain to Counts Resolution Mapping", "MICROSTRAIN",
-                    "Microstrain units (1e-6 strain)"),
-}
 
 ###########################################
 ############# Helper functions ############
 ###########################################
 
-def _setup_logging(log_dir=".", level=logging.INFO):
-    """Attach a log file handler once per session. Safe to call repeatedly.
 
-    Returns the path of the log file.
-    """
-    global _LOG_FILE
-    if _LOG_FILE is not None:
-        return _LOG_FILE
-
-    run_time = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    _LOG_FILE = os.path.join(log_dir, f'DAS_processor_{run_time}.log')
-
-    handler = logging.FileHandler(_LOG_FILE)
-    handler.setFormatter(logging.Formatter(
-        '%(asctime)s %(levelname)s: %(message)s', '%Y-%m-%d %H:%M:%S'))
-
-    root = logging.getLogger()
-    root.addHandler(handler)
-    if root.level == logging.NOTSET or root.level > level:
-        root.setLevel(level)
-    return _LOG_FILE
-        
-def create_global_params(defaults, sources, exec_params):
+def create_global_params(defaults: Any, sources: Any, exec_params: dict[str, Any]) -> dict[str, Any]:
     """Constructs and returns the global configuration dictionary."""
     return {
         "freq_params": defaults.freq_params,
@@ -226,7 +193,7 @@ def _validate_seismic_event_fields(
             )
 
 
-def _is_diverging_cmap(cmap):
+def _is_diverging_cmap(cmap: str | Colormap) -> bool | None:
     """
     True if cmap is a known diverging map, False if a known non-diverging
     map, None if it is in neither set. Handles reversed ('_r') names and
@@ -241,7 +208,9 @@ def _is_diverging_cmap(cmap):
     return None
 
 
-def _auto_clim(data, cmap, pct=98, symmetric=None):
+def _auto_clim(
+    data: np.ndarray, cmap: str | Colormap, pct: float = 98, symmetric: bool | None = None
+) -> tuple[float, float]:
     """
     Colour limits for imshow/pcolormesh that suit the colormap.
 
@@ -263,1043 +232,51 @@ def _auto_clim(data, cmap, pct=98, symmetric=None):
     lo, hi = np.percentile(data, [100 - pct, pct])
     return lo, hi
 
-def check_int32_scaling(data, scale, min_bits=16):
-    """
-    Verify that data * scale fits in int32. Raises before any conversion.
-
-    Raises ValueError for NaN/inf, OverflowError if the scaled peak exceeds
-    int32. Logs a warning if the scaled peak is so small that the integer
-    output has fewer than min_bits of dynamic range.
-    Returns the scaled peak.
-    """
-    arr = np.asarray(data)
-    peak = float(np.max(np.abs(arr)))          # NaN/inf propagate through max
-    if not np.isfinite(peak):
-        n_nan = int(np.isnan(arr).sum())
-        n_inf = int(np.isinf(arr).sum())
-        raise ValueError(
-            f"Cannot convert to int32: data contain {n_nan} NaN and {n_inf} "
-            "inf values. Fix or mask them before scaling.")
-    scaled_peak = peak * scale
-    if scaled_peak > INT32_MAX:
-        raise OverflowError(
-            f"int32 overflow: peak |value| {peak:.3e} x scale {scale:.0e} = "
-            f"{scaled_peak:.3e} exceeds {INT32_MAX}. Largest usable scale is "
-            f"{INT32_MAX / peak:.3e}; use a smaller scale/resolution or write "
-            "float32 MiniSEED instead.")
-    if 0 < scaled_peak < 2 ** min_bits:
-        logging.warning(
-            "int32 output has little dynamic range: scaled peak is %.1f "
-            "counts (< 2^%d). Most of the signal will be lost to rounding; "
-            "check the data units and chosen scale.", scaled_peak, min_bits)
-    return scaled_peak
-
-def design_decimation_fir(factor, window=("kaiser", 5.0)):
-    """
-    The anti-alias FIR that scipy.signal.resample_poly designs by default for
-    up=1, down=factor (Kaiser beta=5, 20*factor+1 taps, cutoff at the new Nyquist).
-    """
-    half_len = 10 * factor
-    return sps.firwin(2 * half_len + 1, 1.0 / factor, window=window)
-
-@staticmethod
-def _make_step(factor, input_rate, *, b=None, a=None, fir=None, label=None):
-    if (fir is None) == (b is None or a is None):
-        raise ValueError("Provide either fir, or both b and a.")
-    return {
-        "factor": int(factor),
-        "input_sampling_rate": float(input_rate),
-        "fir": None if fir is None else np.asarray(fir),
-        "b": None if b is None else np.asarray(b),
-        "a": None if a is None else np.asarray(a),
-        "label": label,
-    }
-
-
-class DictFile(File):
-    """Read and write HDF5 files as nested Python dictionaries."""
-
-    def __init__(self, filename, mode, verbose=False, **kwargs):
-        self.verbose = verbose
-        if verbose:
-            print("Open file: " + str(filename))
-        super().__init__(filename, mode, **kwargs)
-
-    def save_dict(self, data):
-        """Save a nested dictionary tree to this HDF5 file."""
-        if self.verbose:
-            print("Save dictionary tree to: " + str(self.filename))
-        self._save_tree(data, self, 0)
-
-    def load_dict(self, field=None, skipFields=None, getData=True):
-        """Load a dictionary tree, optionally excluding fields or datasets."""
-        if self.verbose:
-            line = "Load dictionary from "
-            if field:
-                line += f'field "{field}"'
-            line += " within " + str(self.filename) + ":"
-            print(line)
-
-        self.skipFields = [] if skipFields is None else skipFields
-        if isinstance(field, str):
-            field = self[field]
-        if isinstance(field, Dataset):
-            return field[()]
-
-        data = {}
-        self._load_tree(self if field is None else field, data, 0, getData)
-        return data
-
-    def load_keys(self):
-        """Load the HDF5 tree with dataset shapes in place of values."""
-        if self.verbose:
-            print("Loading tree structure: " + str(self.filename))
-        data = {}
-        self.skipFields = []
-        self._load_tree(self, data, 0, False)
-        return data
-
-    def _save_tree(self, tree, parent_group, depth):
-        if tree is None or len(tree) == 0:
-            if self.verbose:
-                print("\t" * depth, "-")
-            return
-
-        for key, value in tree.items():
-            if isinstance(value, dict):
-                if self.verbose:
-                    print("\t" * depth + str(key))
-                child_group = parent_group.create_group(str(key))
-                self._save_tree(value, child_group, depth + 1)
-            else:
-                if not isinstance(value, np.ndarray):
-                    value = np.array(value)
-                try:
-                    parent_group.create_dataset(str(key), data=value)
-                except TypeError:
-                    if not isinstance(value, np.ndarray):
-                        raise
-                    parent_group.create_dataset(
-                        str(key), data=np.array(value, dtype="S")
-                    )
-
-            if self.verbose:
-                self._print_info(str(key), value, depth)
-
-    def _load_tree(self, tree, parent_dict, depth, get_data):
-        if tree is None or not isinstance(tree, Group):
-            if self.verbose:
-                print("\t" * depth, "-")
-            return
-
-        for key, value in tree.items():
-            if key in self.skipFields:
-                continue
-            key = int(key) if isinstance(key, str) and key.isdigit() else str(key)
-            if isinstance(value, Group):
-                if self.verbose:
-                    print("\t" * depth + key)
-                parent_dict[key] = {}
-                self._load_tree(value, parent_dict[key], depth + 1, get_data)
-                continue
-
-            if get_data is True or (
-                isinstance(get_data, list) and key in get_data
-            ):
-                if value.dtype.char in "SO":
-                    if value.shape == ():
-                        raw_value = value[()]
-                        if raw_value == b"None":
-                            parent_dict[key] = None
-                        else:
-                            try:
-                                parent_dict[key] = raw_value.decode("utf-8")
-                            except UnicodeDecodeError:
-                                parent_dict[key] = raw_value
-                    else:
-                        parent_dict[key] = np.array(value).astype(str)
-                elif value.shape == ():
-                    parent_dict[key] = value[()].item()
-                else:
-                    parent_dict[key] = np.array(value[()])
-            else:
-                parent_dict[key] = value.shape
-
-            if self.verbose:
-                self._print_info(key, value, depth)
-
-    def _print_info(self, key, value, depth, maxlength=16):
-        prefix = "\t" * depth + ("{} ({}):".format(key, str(value.dtype))).ljust(30)
-        if len(value.shape) == 0 or len(value) <= maxlength:
-            print(prefix + str(value[()]))
-        else:
-            print(prefix + str(value.shape))
-
-
-def save(filename, data, **kwargs):
-    """Save a nested dictionary to an HDF5 file."""
-    with DictFile(filename, "w", **kwargs) as hdf_file:
-        hdf_file.save_dict(data)
-
-
-def load(filename, field=None, skipFields=None, **kwargs):
-    """Load a nested dictionary from an HDF5 file."""
-    with DictFile(filename, "r", **kwargs) as hdf_file:
-        return hdf_file.load_dict(field=field, skipFields=skipFields)
-
-
-def load_keys(filename, **kwargs):
-    """Load an HDF5 tree with shapes in place of dataset values."""
-    with DictFile(filename, "r", **kwargs) as hdf_file:
-        return hdf_file.load_keys()
-
-class DASDataFrame(pd.DataFrame):
-    """Pandas DataFrame carrying DAS metadata."""
-
-    _metadata = ["meta"]
-
-    @property
-    def _constructor(self):
-        return DASDataFrame
-
-    def __init__(
-        self,
-        data: np.ndarray | Iterable | dict | pd.DataFrame = None,
-        index=None,
-        columns=None,
-        dtype=None,
-        copy=None,
-        meta: dict | None = None,
-    ):
-        super().__init__(data, index, columns, dtype, copy)
-        self.meta = {} if meta is None else meta.copy()
-        if self.meta:
-            self._set_dimensionRange()
-
-    def _set_dimensionRange(self):
-        """Compute dimension ranges and sizes from the dataframe axes."""
-        if np.issubdtype(self.columns.dtype, np.str_) or np.issubdtype(
-            self.columns.dtype, object
-        ):
-            chs = np.arange(len(self.columns))
-        else:
-            chs = np.array(self.columns)
-
-        if len(chs) > 2:
-            dchs = np.diff(chs)
-            sdchs = dchs[:-1] != dchs[1:]
-            sdchs &= np.r_[sdchs[1:], False]
-            stopind = np.r_[np.where(sdchs)[0] + 1, len(chs) - 1]
-            startind = np.r_[0, stopind[:-1] + 1]
-            size = np.array(
-                [len(chs[start:end]) + 1 for start, end in zip(startind, stopind)]
-            )
-        else:
-            startind = 0
-            stopind = -1
-            size = len(chs)
-
-        self.meta["dimensionRanges"] = {
-            "dimension0": {
-                "max": self.shape[0] - 1,
-                "min": 0,
-                "size": self.shape[0],
-                "unitScale": self.meta["dt"],
-            },
-            "dimension1": {
-                "max": chs[stopind],
-                "min": chs[startind],
-                "size": size,
-                "unitScale": self.meta["dx"],
-            },
-        }
-        self.meta.update(
-            dimensionSizes=np.r_[self.shape[0], np.sum(size)],
-            dimensionUnits=np.array([b"s", b"m"]),
-        )
-
-def _combine_units(units: list[str], operator: str = "*") -> str:
-    """Combine unit strings using multiplication or division."""
-    known_units = (
-        "rad",
-        "dt",
-        "strain",
-        "W",
-        "NormCts",
-        "m",
-        "K",
-        "s",
-        "Hz",
-        "N",
-        "Pa",
-        "J",
-    )
-    unit_symbols = symbols(known_units)
-    unit_dict = dict(zip(known_units, unit_symbols))
-    units = [unit.replace("·", "*").replace("ε", "strain") for unit in units]
-    combined_unit = sympify(units[0], unit_dict)
-    for unit in units[1:]:
-        if unit:
-            if operator == "/":
-                combined_unit /= sympify(unit, unit_dict)
-            elif operator == "*":
-                combined_unit *= sympify(unit, unit_dict)
-    return str(combined_unit)
-
-
-def _set_sensitivity(
-    header: dict, sensitivitySelect: int, userSensitivity: None | dict = None
-) -> tuple[float, str, float, str]:
-    if sensitivitySelect >= 0:
-        try:
-            sensitivity = header["sensitivities"][sensitivitySelect, :]
-            sensitivity_unit = header["sensitivityUnits"][sensitivitySelect]
-        except KeyError:
-            sensitivity = header["sensitivity"]
-            sensitivity_unit = header["sensitivityUnit"]
-        except IndexError:
-            print("SensitivitySelect index %d not found in file." % sensitivitySelect)
-            raise
-
-        unit_out = _combine_units([header["unit"], sensitivity_unit], "/")
-        sensitivities_out = np.ones((1, 1), dtype=np.float32)
-        sensitivity_units_out = [""]
-    elif sensitivitySelect == -1:
-        unit_out = header["unit"]
-        sensitivity = 1.0
-        sensitivities_out = header["sensitivities"]
-        sensitivity_units_out = header["sensitivityUnits"]
-    elif sensitivitySelect == -2:
-        unit_new = _combine_units([header["unit"], "m"])
-        if not any(unit == "m" for unit in re.findall(r"[\w']+", unit_new)):
-            unit_out = unit_new
-            sensitivity = 1.0 / header["gaugeLength"]
-            sensitivities_out = header["sensitivities"] * header["gaugeLength"]
-            sensitivity_units_out = [
-                _combine_units([unit, "m"]) for unit in header["sensitivityUnits"]
-            ]
-        else:
-            unit_out = header["unit"]
-            sensitivity = 1.0
-            sensitivities_out = header["sensitivities"]
-            sensitivity_units_out = header["sensitivityUnits"]
-    elif sensitivitySelect == -3 and userSensitivity is not None:
-        unit_out = _combine_units(
-            [header["unit"], userSensitivity["sensitivityUnit"]], "/"
-        )
-        sensitivity = userSensitivity["sensitivity"]
-        sensitivities_out = np.ones((1, 1), dtype=np.float32)
-        sensitivity_units_out = [""]
-    else:
-        raise ValueError("Undefined sensitivitySelect")
-
-    return sensitivity, unit_out, sensitivities_out, sensitivity_units_out
-
-
-def _fix_meta_back_compability(meta: dict, nSamples: int, nChannels: int):
-    """Fill metadata fields missing from older DAS file versions."""
-    speed_of_light = 2.99792458e8
-    header = meta["header"]
-
-    if "experiment" not in header and "exp" in header:
-        header["experiment"] = header.pop("exp")
-
-    if "cableSpec" not in meta:
-        meta["cableSpec"] = {
-            "fiberOverLength": 1.0,
-            "refractiveIndex": 1.4677,
-            "zeta": 0.78,
-        }
-
-    if "dx" not in header or "gaugeLength" not in header:
-        dx_fiber = (
-            meta["demodSpec"]["dTau"]
-            * speed_of_light
-            / (2 * meta["cableSpec"]["refractiveIndex"])
-        )
-        if "dx" not in header:
-            header["dx"] = dx_fiber / meta["cableSpec"]["fiberOverLength"]
-        if "gaugeLength" not in header:
-            header["gaugeLength"] = meta["demodSpec"]["nDiffTau"] * dx_fiber
-
-    if "dataScale" not in header:
-        header["dataScale"] = (
-            np.pi / 2**29 / header["dt"] / header["gaugeLength"]
-        )
-        header["unit"] = "rad/m/s"
-    if "spatialUnwrRange" not in header:
-        header["spatialUnwrRange"] = (
-            8 * np.pi / header["dt"] / header["gaugeLength"]
-        )
-
-    if "dimensionRanges" not in header:
-        dimension_ranges = {}
-        dimension_ranges["dimension0"] = {
-            "min": 0,
-            "max": nSamples - 1,
-            "size": nSamples,
-            "unitScale": header["dt"],
-        }
-        try:
-            processing_chain = (
-                meta["processingChain"]
-                if "processingChain" in meta
-                else meta["dimChain"]
-            )
-            step_number = 0
-            while "step-%d" % step_number in processing_chain:
-                step_number += 1
-            columns = processing_chain["step-%d" % (step_number - 1)]["cols"]
-        except (KeyError, TypeError):
-            columns = meta["demodSpec"]
-
-        dimension_ranges["dimension1"] = {
-            "min": columns["roiStart"],
-            "max": columns["roiEnd"],
-            "size": (
-                columns["roiEnd"] - columns["roiStart"] + 1
-            )
-            // columns["roiDec"],
-            "unitScale": header["dx"],
-        }
-        header["dimensionRanges"] = dimension_ranges
-        header.update(
-            dimensionSizes=np.r_[nSamples, nChannels],
-            dimensionNames=["time", "distance"],
-            dimensionUnits=["s", "m"],
-            name="Phase rate per distance",
-        )
-
-    dimension = header["dimensionRanges"]["dimension1"]
-    if not isinstance(dimension["min"], Iterable):
-        dimension.update({key: np.r_[value] for key, value in dimension.items()})
-
-    if "channels" not in header:
-        roi_channels = []
-        for start, stop, size in zip(
-            dimension["min"], dimension["max"], dimension["size"]
-        ):
-            roi_channels.append(
-                np.arange(start, stop + 1, (stop - start + 1) // size)
-            )
-        header["channels"] = np.sort(np.unique(np.concatenate(roi_channels)))
-
-    try:
-        itu = int(meta["monitoring"]["Laser"]["itu"])
-    except (KeyError, TypeError, ValueError):
-        itu = 51
-    wavelength = speed_of_light / (190e12 + itu * 1e11)
-
-    if "sensitivity" in header:
-        header["sensitivities"] = np.atleast_2d(header.pop("sensitivity"))
-        header["sensitivityUnits"] = np.atleast_1d(header.pop("sensitivityUnit"))
-
-    if "sensitivities" not in header or "NA" in header["sensitivityUnits"]:
-        header["sensitivities"] = np.atleast_2d(
-            4
-            * np.pi
-            * meta["cableSpec"]["zeta"]
-            * meta["cableSpec"]["refractiveIndex"]
-            / wavelength
-        )
-        header["sensitivityUnits"] = np.atleast_1d("rad/m/strain")
-    elif len(header["sensitivityUnits"]) and "unit" in header:
-        normalized_units = []
-        for sensitivity_unit in header["sensitivityUnits"].copy():
-            output_unit = _combine_units([header["unit"], sensitivity_unit], "/")
-            if "rad" in re.findall(r"[\w']+", output_unit):
-                sensitivity_unit = output_unit
-            normalized_units.append(
-                sensitivity_unit.replace("·", "*").replace("ε", "strain")
-            )
-        header["sensitivityUnits"] = np.array(normalized_units)
-
-    if "unit" in header:
-        header["unit"] = header["unit"].replace("·", "*").replace("ε", "strain")
-    if "sensorType" not in header:
-        header["sensorType"] = ["D"]
-
-
-def get_data_indexes(
-    ffidpath: str | list[str],
-    trange: None | list[float] | np.ndarray = None,
-    channels: None | slice | list[int] | np.ndarray = None,
-    show_header_info: bool = True,
-):
-    """Compute DAS sample and channel indexes from time and channel selections."""
-    if isinstance(ffidpath, list):
-        ffidpath = ffidpath[0]
-    with DictFile(ffidpath, "r") as das_file:
-        metadata = das_file.load_dict(skipFields=["data"])
-        n_samples, n_channels = das_file["data"].shape
-        _fix_meta_back_compability(metadata, n_samples, n_channels)
-
-    header = metadata["header"]
-    header_time = datetime.datetime.utcfromtimestamp(float(header["time"]))
-    if trange is None:
-        samples = slice(None)
-    else:
-        if isinstance(trange, (int, float)):
-            trange = (0.0, trange)
-        elif len(trange) == 1:
-            trange = (0.0, trange[0])
-        samples_to_read = int(np.diff(trange)[0] / header["dt"] + 0.5)
-        sample_start = int(trange[0] / header["dt"] + 0.5)
-        samples = slice(sample_start, sample_start + samples_to_read)
-
-    if show_header_info:
-        print("-- Header info file: %s --" % os.path.basename(ffidpath))
-        print("\tExperiment:            %s" % header["experiment"])
-        print("\tFile timestamp:        %s" % header_time.strftime("%Y-%m-%d %H:%M:%S"))
-        print(
-            "\tType of data:          {}, unit: {}".format(
-                header["name"], header["unit"]
-            )
-        )
-        print("\tSampling frequency:    %.2f Hz" % (1.0 / header["dt"]))
-        print(
-            "\tData shape:            %d samples x %d channels"
-            % (n_samples, n_channels)
-        )
-        print("\tGauge length:          %.1f m" % header["gaugeLength"])
-        print(
-            "\tSensitivities:         %s"
-            % ",".join(
-                "{:.2e} {}".format(sensitivity, unit)
-                for sensitivity, unit in zip(
-                    header["sensitivities"][:, 0], header["sensitivityUnits"]
-                )
-            )
-        )
-        try:
-            dimension = header["dimensionRanges"]["dimension1"]
-            regions = ",".join(
-                "%d:%d:%d"
-                % (
-                    start,
-                    stop,
-                    1 if stop <= start else (stop - start) // (size - 1),
-                )
-                for start, stop, size in zip(
-                    dimension["min"], dimension["max"], dimension["size"]
-                )
-            )
-            print("\tRegions of interest:   %s" % regions)
-        except (KeyError, TypeError, ZeroDivisionError):
-            pass
-
-    if isinstance(channels, slice):
-        channels = np.arange(header["channels"][-1])[channels]
-
-    header_channels = header["channels"]
-    if channels is not None:
-        channels_found, ch_index, _ = np.intersect1d(
-            header_channels, channels, return_indices=True
-        )
-        if show_header_info:
-            with np.printoptions(threshold=20):
-                print("\t%d channels requested:%s" % (len(channels), channels))
-                print(
-                    "\t%d channels found:    %s" % (len(channels_found), channels_found)
-                )
-    else:
-        ch_index = np.arange(len(header_channels))
-    if show_header_info:
-        print("-----------------------------------")
-
-    if len(ch_index) == 0:
-        raise ValueError("Selected channels are not in found in file!")
-    return ch_index, samples
-
-
-def get_filemeta(filepath: str, metaDetail: int = 1):
-    """Read file metadata, optionally limiting output to interpretation fields."""
-    with DictFile(filepath, "r") as das_file:
-        metadata = das_file.load_dict(skipFields=["data"])
-    if metaDetail != 1:
-        return metadata
-
-    monitoring = metadata["monitoring"]
-    return {
-        "fileVersion": metadata["fileVersion"],
-        "header": metadata["header"],
-        "timing": metadata["timing"],
-        "cableSpec": metadata["cableSpec"],
-        "monitoring": {
-            "Gps": monitoring["Gps"],
-            "Laser": {"itu": monitoring["Laser"]["itu"]},
-        },
-    }
-
-
-def save_to_DAS_file(
-    dfdas: DASDataFrame,
-    filepath: None | str = None,
-    datatype: str = "processed",
-    **auxmeta,
-) -> tuple[str, dict]:
-    """Save a DAS dataframe in a format readable by :func:`load_DAS_files`."""
-    if filepath is None:
-        timestr = dfdas.meta["time"].strftime("%H%M%S")
-        filename = timestr + ".hdf5"
-        original_filepath = dfdas.meta["filepaths"][0]
-        original_directory, _ = os.path.split(original_filepath)
-        experiment_path, _ = os.path.split(original_directory)
-        filepath = os.path.join(experiment_path, datatype, filename)
-
-    directory, _ = os.path.split(filepath)
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-    print("Saving to file: " + filepath)
-
-    timestamp = dfdas.meta["time"].replace(
-        tzinfo=datetime.timezone.utc
-    ).timestamp()
-    dfdas._set_dimensionRange()
-    header = {
-        "channels": dfdas.columns.values,
-        "dataScale": np.float32(1.0),
-        "spatialUnwrRange": np.float32(0.0),
-    }
-    header.update(**dfdas.meta)
-    header.update(time=timestamp)
-
-    file_version = header.pop("fileVersion")
-    ffid_dict = {"header": {}, "fileVersion": file_version}
-    ffid_dict.update(data=np.asarray(dfdas, dtype=np.float32), **auxmeta)
-    ffid_dict["header"].update(**header)
-
-    save(filepath, ffid_dict)
-    return filepath, ffid_dict
-
-
-def str2datetime(sdt: str, dateonly: bool = False) -> datetime.datetime:
-    """Convert DAS time strings to datetime objects."""
-    if isinstance(sdt, datetime.datetime):
-        return sdt
-    if dateonly:
-        return datetime.datetime.strptime(sdt, "%Y%m%d")
-    try:
-        return datetime.datetime.strptime(sdt, "%H%M%S")
-    except ValueError:
-        return datetime.datetime.strptime(sdt, "%Y%m%d %H%M%S")
-
-
-def convert_index_to_rel_time(dfdas: DASDataFrame):
-    """Replace a datetime index with seconds relative to its first sample."""
-    dfdas["t"] = (dfdas.index - dfdas.index[0]).total_seconds()
-    dfdas.set_index("t", inplace=True)
-
-
-def create_time_axis(
-    tstart: datetime.datetime, nSamples: int, dt: float
-) -> pd.DatetimeIndex:
-    """Create a datetime index for DAS samples at interval ``dt`` seconds."""
-    return tstart + pd.timedelta_range(
-        start="0s", periods=nSamples, freq="%dns" % int(dt * 1e9 + 0.5)
-    )
 
         
 
-def unwrap(
-    phi: np.ndarray, wrapStep: float = 2 * np.pi, axis: int = -1
-) -> np.ndarray:
-    """Unwrap phase values with the specified wrap interval."""
-    scale = 2 * np.pi / wrapStep
-    return (np.unwrap(phi * scale, axis=axis) / scale).astype(phi.dtype)
-
-
-def wrap(x: np.ndarray, wrapStep: float = 2 * np.pi) -> np.ndarray:
-    """Wrap values to ``[-wrapStep/2, wrapStep/2)``."""
-    if wrapStep > 0:
-        return (x + wrapStep / 2) % wrapStep - wrapStep / 2
-    return x
-
-
-def find_DAS_files(
-    experiment_path: str,
-    start: str | datetime.datetime,
-    duration: float | datetime.timedelta,
-    channels: None | slice | list[int] | np.ndarray = None,
-    datatype: str = "dphi",
-    show_header_info: bool = True,
-    load_file_from_start: bool = True,
-) -> tuple[list[str], np.ndarray | None, slice | None]:
-    """Find DAS files overlapping a time interval and select data indexes."""
-
-    def checkdate(date_string):
-        return datetime.datetime.strptime(date_string, "%Y%m%d").strftime("%Y%m%d")
-
-    exper_path = experiment_path
-    dates_in_exp = []
-    exppath_has_dates = False
-    for date_entry in sorted(os.listdir(exper_path)):
-        if os.path.isdir(os.path.join(exper_path, date_entry)):
-            try:
-                dates_in_exp.append(checkdate(date_entry))
-                exppath_has_dates = True
-            except ValueError:
-                pass
-
-    if not exppath_has_dates:
-        path = exper_path
-        previous_component = ""
-        for _ in range(2):
-            path, component = os.path.split(path)
-            try:
-                dates_in_exp.append(checkdate(component))
-                exppath_has_dates = True
-                exper_path = path
-                if previous_component:
-                    datatype = previous_component
-                break
-            except ValueError:
-                previous_component = component
-        if not dates_in_exp:
-            dates_in_exp.append("19000101")
-
-    if isinstance(start, str):
-        datetime_start = str2datetime(start)
-    else:
-        datetime_start = start
-    if datetime_start.year == 1900 and exppath_has_dates:
-        datetime_start += str2datetime(dates_in_exp[0], True) - datetime.datetime(
-            1900, 1, 1
-        )
-
-    if not isinstance(duration, datetime.timedelta):
-        duration = datetime.timedelta(seconds=duration)
-    datetime_stop = datetime_start + duration
-
-    filepaths = []
-    header_times = []
-    for date_in_exp in dates_in_exp:
-        date = str2datetime(date_in_exp, True)
-        if datetime_start.date() <= date.date() <= datetime_stop.date():
-            data_directory = (
-                os.path.join(exper_path, date_in_exp, datatype)
-                if exppath_has_dates
-                else exper_path
-            )
-            for filename in sorted(os.listdir(data_directory)):
-                try:
-                    file_time = str2datetime(
-                        date_in_exp + " " + os.path.splitext(filename)[0]
-                    )
-                except ValueError:
-                    continue
-
-                if not (
-                    datetime_start - datetime.timedelta(seconds=11)
-                    < file_time
-                    <= datetime_stop + datetime.timedelta(seconds=1)
-                ):
-                    continue
-
-                filepath = os.path.join(data_directory, filename)
-                with DictFile(filepath, "r") as das_file:
-                    header_time = datetime.datetime.utcfromtimestamp(
-                        float(das_file["header"]["time"][()])
-                    )
-                if datetime_start.year == 1900:
-                    header_time += datetime.datetime(1900, 1, 1) - datetime.datetime.combine(
-                        header_time.date(), datetime.time(0)
-                    )
-                if (
-                    datetime_start - datetime.timedelta(seconds=10)
-                    < header_time
-                    <= datetime_stop
-                ):
-                    filepaths.append(filepath)
-                    header_times.append(header_time)
-
-    if filepaths:
-        start_time = (
-            0.0
-            if load_file_from_start
-            else max(0.0, (datetime_start - header_times[0]).total_seconds())
-        )
-        ch_index, samples = get_data_indexes(
-            filepaths,
-            (start_time, start_time + duration.total_seconds()),
-            channels,
-            show_header_info,
-        )
-    else:
-        ch_index = None
-        samples = None
-        warnings.warn(
-            "DAS_processor.find_DAS_files did not find any files", UserWarning
-        )
-
-    return filepaths, ch_index, samples
-
-
-def load_DAS_files(
-    filepaths: str | list[str],
-    chIndex: None | slice | list[int] | np.ndarray = None,
-    samples: None | slice | int = None,
-    sensitivitySelect: int = 0,
-    integrate: bool = True,
-    unwr: bool = False,
-    spikeThr: None | float = None,
-    userSensitivity: None | dict = None,
-    useLabeledColumns: None | bool = None,
-    verbose: bool = False,
-) -> DASDataFrame:
-    """Load OptoDAS HDF5 files into a metadata-aware dataframe."""
-    loadstart = datetime.datetime.now()
-
-    if isinstance(filepaths, str):
-        filepaths = [filepaths]
-    if filepaths is None or len(filepaths) == 0:
-        raise ValueError("No filepaths provided")
-
-    if isinstance(samples, range):
-        samples = slice(samples.start, samples.stop, samples.step)
-    if isinstance(samples, int):
-        samples = slice(0, samples)
-    elif samples is None:
-        samples = slice(None)
-    if samples.step is not None and samples.step > 1:
-        raise ValueError("Sample step>1 in time is not supported")
-
-    if chIndex is None:
-        chIndex = slice(None)
-    elif not isinstance(chIndex, slice):
-        chIndex = np.atleast_1d(chIndex)
-        if len(chIndex) == 0:
-            raise ValueError("Selected channels are not in found in file!")
-        if len(chIndex) == 1:
-            chIndex = slice(chIndex[0], chIndex[0] + 1, 1)
-        else:
-            channel_steps = np.diff(chIndex)
-            if np.all(channel_steps == channel_steps[0]):
-                chIndex = slice(chIndex[0], chIndex[-1] + 1, channel_steps[0])
-
-    samples_read = 0
-    if verbose:
-        print("Loading files:", end=" ")
-
-    for file_number, filepath in enumerate(filepaths):
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"{filepath} not found")
-        if verbose:
-            print(os.path.basename(filepath), end=" ")
-
-        with DictFile(filepath, "r") as das_file:
-            if das_file["data"].ndim > 2:
-                raise IndexError(
-                    "simpleDAS does not handle data with more than 2 dimensions"
-                )
-            samples_in_file, channels_in_file = das_file["data"].shape
-
-            if file_number == 0:
-                channels_out = np.arange(channels_in_file)[chIndex].size
-                samples_max = (samples_in_file + 1) * len(filepaths)
-                samples_out = np.arange(samples_max)[samples].size
-                samples_remaining = samples_out
-                data = np.zeros((samples_out, channels_out), dtype=np.float32)
-
-                metadata = das_file.load_dict(skipFields=["data"])
-                _fix_meta_back_compability(
-                    metadata, samples_in_file, channels_in_file
-                )
-
-                if metadata["header"]["channels"][chIndex].size == 0:
-                    raise IndexError(
-                        f"chIndexes {chIndex} not in data "
-                        f"(nChannels = {channels_in_file})"
-                    )
-
-                (
-                    sensitivity,
-                    unit_out,
-                    sensitivities_out,
-                    sensitivity_units_out,
-                ) = _set_sensitivity(
-                    metadata["header"], sensitivitySelect, userSensitivity
-                )
-                if not isinstance(sensitivity, np.ndarray) or sensitivity.size == 1:
-                    if sensitivity == 0.0:
-                        raise ValueError(
-                            "Sensitivity value set to zero, use "
-                            "sensitivitySelect=-1 or -2 to avoid error"
-                        )
-                    scale = np.float32(
-                        metadata["header"]["dataScale"] / sensitivity
-                    )
-                else:
-                    if channels_in_file != len(sensitivity):
-                        raise ValueError(
-                            "Length of sensitivity vector does not match "
-                            "number of channels"
-                        )
-                    if not np.any(sensitivity != 0.0):
-                        raise ValueError(
-                            "Sensitivity value set to zero, use "
-                            "sensitivitySelect=-1 or -2 to avoid error"
-                        )
-                    sensitivity = np.atleast_2d(sensitivity[chIndex])
-                    scale = np.array(
-                        metadata["header"]["dataScale"] / sensitivity,
-                        dtype=np.float32,
-                    )
-
-                if samples.stop is None or samples.stop > samples_in_file:
-                    samples_to_read = slice(samples.start, None)
-                else:
-                    samples_to_read = slice(samples.start, samples.stop)
-            elif samples_remaining >= samples_in_file:
-                samples_to_read = slice(None)
-            else:
-                samples_to_read = slice(0, samples_remaining)
-
-            try:
-                sub_data = das_file["data"][samples_to_read, chIndex]
-            except TypeError:
-                warnings.warn(
-                    "h5py does not accept complex slices. Slow read...", UserWarning
-                )
-                sub_data = das_file["data"][:, chIndex][samples_to_read, :]
-
-            samples_read_in_file = sub_data.shape[0]
-            data[samples_read : samples_read + samples_read_in_file, :] = (
-                np.atleast_2d(sub_data) * scale
-            )
-            samples_read += samples_read_in_file
-            samples_remaining = samples_out - samples_read
-
-    if verbose:
-        print(" in %.1f s" % (datetime.datetime.now() - loadstart).total_seconds())
-        print("Conditioning... ", end="")
-    data = data[:samples_read, :]
-
-    if (unwr or spikeThr or integrate) and metadata["header"]["dataType"] == 2:
-        unwr, spikeThr, integrate = (False,) * 3
-        warnings.warn(
-            "Options unwr, spikeThr or integrate can only be used with "
-            "time differentiated phase data",
-            UserWarning,
-        )
-
-    if unwr and metadata["header"]["spatialUnwrRange"]:
-        data = unwrap(
-            data, metadata["header"]["spatialUnwrRange"] / sensitivity, axis=1
-        )
-    if spikeThr is not None:
-        data[np.abs(data) > spikeThr / sensitivity] = 0
-
-    if integrate:
-        unit_new = _combine_units([unit_out, "s"])
-        if not any(unit == "s" for unit in re.findall(r"[\w']+", unit_new)):
-            data = np.cumsum(data, axis=0) * metadata["header"]["dt"]
-            unit_out = unit_new
-        else:
-            warnings.warn(
-                "Data unit %s is not differentiated. Integration skipped." % unit_out,
-                UserWarning,
-            )
-        metadata["header"]["name"] = metadata["header"]["name"].replace(
-            " rate", ""
-        )
-
-    sample_start = 0 if samples.start is None else samples.start
-    time_start = datetime.datetime.utcfromtimestamp(
-        metadata["header"]["time"] + sample_start * metadata["header"]["dt"]
-    )
-    n_samples, _ = data.shape
-    time_axis = create_time_axis(time_start, n_samples, metadata["header"]["dt"])
-
-    meta = {
-        key: metadata["header"][key]
-        for key in (
-            "dt",
-            "dx",
-            "gaugeLength",
-            "experiment",
-            "dataType",
-            "dimensionRanges",
-            "dimensionUnits",
-            "dimensionNames",
-            "name",
-            "sensorType",
-        )
-    }
-    meta.update(
-        fileVersion=metadata["fileVersion"],
-        time=time_start,
-        unit=unit_out,
-        sensitivities=sensitivities_out,
-        sensitivityUnits=sensitivity_units_out,
-        filepaths=filepaths,
-    )
-
-    if useLabeledColumns is not False:
-        if len(metadata["header"]["sensorType"]) != channels_in_file:
-            if useLabeledColumns is None:
-                columns = metadata["header"]["channels"][chIndex]
-            else:
-                raise ValueError("Cannot use labeled columns")
-        else:
-            columns = metadata["header"]["sensorType"][chIndex]
-    else:
-        columns = metadata["header"]["channels"][chIndex]
-
-    dfdas = DASDataFrame(data, columns=columns, index=time_axis, meta=meta)
-    if verbose:
-        print(
-            "Total load time: %.1f s"
-            % (datetime.datetime.now() - loadstart).total_seconds()
-        )
-    return dfdas
 
 ########################################
 ###### Event processing functions ######
 ########################################
 
-def process_events(events_to_process, global_params):
-    _setup_logging()
+def process_events(events_to_process: list[str], global_params: dict[str, Any]):
+    _setup_logging(verbose=global_params.get("exec_params", {}).get("verbose"))
     
     sources = global_params.get("sources", {})
     station = global_params.get("exec_params", {}).get("station", "")   
     station_coordinates = global_params.get("station_coordinates", {})
     exec_params = global_params.get("exec_params", {})
 
-    # Output the execution parameters used to the log file and console if verbose is enabled
-    if exec_params.get("verbose"):
-        print("exec_params:")
-
-    logging.info("EXEC Parameters are:")
+    # Execution parameters go to the log file, and to the console when verbose is enabled
+    logger.debug("EXEC Parameters are:")
     for key, value in exec_params.items():
         if value:
-            logging.info(f"{key}: {value}")
-            if exec_params.get("verbose"):
-                print(f"{key}: {value}")
-    logging.info('#############################')
+            logger.debug(f"{key}: {value}")
+    logger.debug('#############################')
 
     validate_source_channel_ranges(events_to_process, global_params)
     _validate_seismic_event_fields(events_to_process, global_params)
 
     if not any(event in sources for event in events_to_process):
-        logging.error("List of events to process did not match any event in sources.py.")
-        logging.info("Nothing to do in `process_events`")
-        print(f"List of events to process ({events_to_process}) did not match any event in sources.py.")
-        print("Nothing to process.")
+        logger.error("List of events to process did not match any event in sources.py.")
+        logger.info("Nothing to do in `process_events`")
+        logger.warning(f"List of events to process ({events_to_process}) did not match any event in sources.py.")
+        logger.warning("Nothing to process.")
         return None
     
-    print("######################")
-    print('»»» Processing event windows.')
+    logger.info("######################")
+    logger.info('»»» Processing event windows.')
     for event in tqdm(events_to_process, desc="Processing events"):
         if not event in sources:
             valid_events = "\n".join(key for key in sources)
-            print(f'{event} not in list of defined events.\nValid events are:\n{valid_events}')
+            logger.warning(f'{event} not in list of defined events.\nValid events are:\n{valid_events}')
             continue
         else:
-            print(f'Working on event: {event}.')
+            logger.info(f'Working on event: {event}.')
 
-        print(f'#########################\n#########################\n\n')
-        print(f'Processing event {event}. station: {station},station_coordinates: {station_coordinates[station]}')
+        logger.info(f'#########################\n#########################\n\n')
+        logger.info(f'Processing event {event}. station: {station},station_coordinates: {station_coordinates[station]}')
 
         start_time_event = time.time()
 
@@ -1309,16 +286,16 @@ def process_events(events_to_process, global_params):
 
         # Get the operation mode, defaulting to 'seismic' if not specified
         event_mode = DAS.event_info.get("mode", "")
-        print(f"Event mode: {event_mode}")
+        logger.info(f"Event mode: {event_mode}")
         success = False
 
         with DAS.temporary_event_paths(event):
             if event_mode == "time_lapse":
-                logging.info(f"Processing time lapse for event: {event}")
+                logger.info(f"Processing time lapse for event: {event}")
                 DAS.process_time_lapse(event)
 
             elif event_mode == "s3_download":
-                logging.info(f"Downloading data from S3 for event: {event}")
+                logger.info(f"Downloading data from S3 for event: {event}")
                 success=get_data_from_S3(
                 bucket_name=DAS.event_info["s3_bucket"],
                 endpoint_url=DAS.event_info["endpoint_url"],
@@ -1328,60 +305,60 @@ def process_events(events_to_process, global_params):
                 unsigned=DAS.event_info["unsigned", False]
             )
                 if success:
-                    print(f"S3 download for {event} completed successfully.")
+                    logger.info(f"S3 download for {event} completed successfully.")
                     success = False
             elif event_mode == "delete_data":
-                logging.info(f"Deleting data for event: {event}")
+                logger.info(f"Deleting data for event: {event}")
                 DAS.delete_event_data(event)
             else:
                 # 2. Load event (check if files exist, load data, populate metadata)
-                logging.info(f"Loading event data for event: {event} in mode: {event_mode}")
+                logger.info(f"Loading event data for event: {event} in mode: {event_mode}")
                 success = DAS.load_event_data(event, mode=event_mode)
 
             # 3. Check result
             if success:
-                print("Event data loaded successfully!"
+                logger.info("Event data loaded successfully!"
                       f"Shape of DAS data (samples x channels): {DAS.dfdas.shape}"
                       f"DFDAS start time: {DAS.datetime_start}, duration: {DAS.duration} seconds.")
-                logging.info(f"Event data loaded successfully for event: {event}\n"
+                logger.info(f"Event data loaded successfully for event: {event}\n"
                              f"Shape of DAS data (samples x channels): {DAS.dfdas.shape}\n"
                              f"DFDAS start time: {DAS.datetime_start}, duration: {DAS.duration} seconds.")
 
                 event_info = DAS.sources.get(event, {})
                 process_chain = event_info.get('process_chain')
                 if process_chain: # This evaluates to True if it's a non-empty list
-                    logging.info(f"Executing process chain for {event}...")
-                    print(f"Executing process chain for {event}...")
+                    logger.info(f"Executing process chain for {event}...")
+                    logger.info(f"Executing process chain for {event}...")
                     DAS.run_process_chain() 
-                    print("Process chain completed.")
+                    logger.info("Process chain completed.")
                 else:
-                    logging.info(f"No process chain defined for {event}. Skipping automated steps.")
-                    print(f"No process chain defined for {event}. Skipping automated steps.")
+                    logger.info(f"No process chain defined for {event}. Skipping automated steps.")
+                    logger.warning(f"No process chain defined for {event}. Skipping automated steps.")
             elif event_mode != "time_lapse":
-                logging.error(f"Event processing failed or no data was found for event: {event}")
-                print("Event processing failed or no data was found.")
+                logger.error(f"Event processing failed or no data was found for event: {event}")
+                logger.error("Event processing failed or no data was found.")
 
             end_time_event = time.time()
             elapsed_time = end_time_event - start_time_event
 
-        print(f"\n>>> FINISHED: {event}")
-        print(f">>> Execution time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
-        print("#########################\n")
+        logger.info(f"\n>>> FINISHED: {event}")
+        logger.info(f">>> Execution time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+        logger.info("#########################\n")
 
         if event_mode == "time_lapse" or event_mode == "s3_download" or event_mode == "delete_data":
-            print(f'Processing mode "{event_mode}" does not require data loading.\nNo data is available for further processing.')
+            logger.info(f'Processing mode "{event_mode}" does not require data loading.\nNo data is available for further processing.')
         else:
-            print(f"Loaded data for {event} was returned.")
+            logger.info(f"Loaded data for {event} was returned.")
 
     if "DAS" not in locals() or DAS is None:
-        print("No data loaded.")
-        logging.warning("No data loaded.")
+        logger.warning("No data loaded.")
+        logger.warning("No data loaded.")
     return DAS
 
 # define class for storing results
 
 class DASProcessor:
-    def __init__(self, global_params):
+    def __init__(self, global_params: dict[str, Any]) -> None:
         self.exec_params = global_params.get('exec_params', {})
         self.path_params = global_params.get('path_params', {})
         self.sources = global_params.get('sources', {})
@@ -1422,12 +399,18 @@ class DASProcessor:
         self.channel_step = []
         self.chIndex = []
 
+        self.whale_figure = None   # last figure drawn by baleen_whale_detector
+
         # Set up basic logging configuration with execution timestamp
-        _setup_logging()
+        _setup_logging(verbose=self.exec_params.get("verbose"))
 
 
     @staticmethod
-    def _make_step(factor, input_rate, *, b=None, a=None, fir=None, label=None):
+    def _make_step(
+        factor: int, input_rate: float, *,
+        b: np.ndarray | None = None, a: np.ndarray | None = None,
+        fir: np.ndarray | None = None, label: str | None = None,
+    ) -> dict[str, Any]:
         if (fir is None) == (b is None or a is None):
             raise ValueError("Provide either fir, or both b and a.")
         return {
@@ -1439,13 +422,13 @@ class DASProcessor:
             "label": label,
         }
 
-    def get_decimation_steps(self):
+    def get_decimation_steps(self) -> list:
         """Steps applied to self.dfdas, then those applied to the current stream."""
         st_steps = (getattr(self.mseed_stream, "decimation_steps", [])
         if self.mseed_stream is not None else [])
         return list(self.dfdas_decimation_steps) + list(st_steps)
     
-    def get_current_params(self):
+    def get_current_params(self) -> dict[str, Any]:
         """Returns the internal state in the old dictionary format for compatibility."""
         return {
             'exec_params': self.exec_params,
@@ -1484,13 +467,13 @@ class DASProcessor:
             # 3. Apply path overrides (checking explicitly for None so empty strings/False aren't skipped)
             for key, new_val in path_overrides.items():
                 if new_val is not None:
-                    print(f"Override: Setting path_params[{key}] to {new_val}")
+                    logger.info(f"Override: Setting path_params[{key}] to {new_val}")
                     self.path_params[key] = new_val
 
             # Apply execution overrides (using 'is not None' so False is successfully set!)
             for key, new_val in exec_overrides.items():
                 if new_val is not None:
-                    print(f"Override: Setting exec_params[{key}] to {new_val}")
+                    logger.info(f"Override: Setting exec_params[{key}] to {new_val}")
                     self.exec_params[key] = new_val
 
             yield  # <--- Processing runs here
@@ -1503,7 +486,7 @@ class DASProcessor:
             for key, old_val in original_exec.items():
                 self.exec_params[key] = old_val
 
-            print("Paths and execution parameters restored to defaults.")
+            logger.info("Paths and execution parameters restored to defaults.")
 
     def run_process_chain(self, suffix=""):
         """
@@ -1515,7 +498,6 @@ class DASProcessor:
         """
 
         chain = self.event_info.get('process_chain', [])
-        ep = self.exec_params
 
         for step in chain:
             operation = step.get('operation')
@@ -1523,17 +505,16 @@ class DASProcessor:
             # Work on a copy: the original step['params'] stays untouched
             params = dict(step.get('params') or {})
 
-            logging.info(f"Processing step: {operation} with params: {params}")
+            logger.info(f"Processing step: {operation} with params: {params}")
             
             if not hasattr(self, operation):
-                print(f"Warning: Method {operation} not found in DASProcessor.")
-                logging.warning(f"Method {operation} not found in DASProcessor.")
+                logger.warning(f"Warning: Method {operation} not found in DASProcessor.")
+                logger.warning(f"Method {operation} not found in DASProcessor.")
                 continue
 
             method = getattr(self, operation)
-            logging.info(f"Executing step: {operation} with params: {params}")
-            if ep.get("verbose"):
-                print(f"--- Executing: {operation} with params {params} ---")
+            logger.info(f"Executing step: {operation} with params: {params}")
+            logger.debug(f"--- Executing: {operation} with params {params} ---")
             
             # 1. Accepted arguments of the method
             sig = inspect.signature(method)
@@ -1560,7 +541,7 @@ class DASProcessor:
 
             # 4. Call
             method(**call_params)
-            logging.info(f"Completed step: {operation}")
+            logger.info(f"Completed step: {operation}")
 
     def get_time_lapse_windows(self):
         """Generates start times for continuous windows."""
@@ -1574,12 +555,12 @@ class DASProcessor:
             start_times.append(current)
             current += datetime.timedelta(seconds=duration)
 
-        print(f'{len(start_times)} windows of {duration}s to process')
+        logger.info(f'{len(start_times)} windows of {duration}s to process')
         return start_times, duration
     
     def process_time_lapse(self, event):
         """Main loop for time-lapse processing."""
-        print(f'»»» Working on time lapse: {event}')
+        logger.info(f'»»» Working on time lapse: {event}')
         
         # 1. Generate the windows
         start_times, window_duration = self.get_time_lapse_windows()
@@ -1595,10 +576,10 @@ class DASProcessor:
 
             # Check if we should skip before loading raw data
             if os.path.exists(target_hdf5):
-                print(f"Window {i+1}/{len(start_times)}: Skipping (Already exists: {os.path.basename(target_hdf5)})")
+                logger.info(f"Window {i+1}/{len(start_times)}: Skipping (Already exists: {os.path.basename(target_hdf5)})")
                 continue
 
-            print(f"\n--- Processing Window {i+1}/{len(start_times)}: {start_dt} ---")
+            logger.info(f"\n--- Processing Window {i+1}/{len(start_times)}: {start_dt} ---")
             
             # Update the start time for this iteration
             self.datetime_start = start_dt
@@ -1617,7 +598,7 @@ class DASProcessor:
                 self.mseed_stream = None 
                 self.dfdas = None
             else:
-                print(f"Skipping window {i+1} due to loading error.")
+                logger.warning(f"Skipping window {i+1} due to loading error.")
     
         return False
 
@@ -1657,31 +638,29 @@ class DASProcessor:
         )
 
         warning = f"WARNING: deleting raw DAS data for event {event}."
-        print(warning)
-        logging.warning(warning)
-        print(
-            f"Deletion summary:\n"
+        logger.warning("%s", warning)
+        logger.warning(warning)
+        logger.info(f"Deletion summary:\n"
             f"  Time range: {start_time} to {end_time}\n"
             f"  Experiment path: {experiment_path}\n"
-            f"  {len(files)} files selected :"
-        )
+            f"  {len(files)} files selected :")
         for filepath in files:
-            print(f"  - {filepath}")
+            logger.info(f"  - {filepath}")
 
         if not files:
-            print("No matching DAS files found; nothing was deleted.")
-            logging.info(f"No DAS files found for event {event}; nothing was deleted.")
+            logger.warning("No matching DAS files found; nothing was deleted.")
+            logger.info(f"No DAS files found for event {event}; nothing was deleted.")
             return []
 
         if dry_run:
-            print("Dry run enabled; no files were deleted.")
-            logging.info(f"Dry run: no DAS files deleted for event {event}.")
+            logger.info("Dry run enabled; no files were deleted.")
+            logger.info(f"Dry run: no DAS files deleted for event {event}.")
         else:
             for filepath in files:
                 os.remove(filepath)
             message=f"Deleted {len(files)} DAS files for event {event}."
-            print(message)
-            logging.info(message)
+            logger.info("%s", message)
+            logger.info(message)
 
         return
 
@@ -1689,7 +668,7 @@ class DASProcessor:
         """
         The main pipeline execution method. 
         """
-        print(f'Working on event: {event}.')
+        logger.info(f'Working on event: {event}.')
 
         # 1. Initial setup
         self.dfdas = None
@@ -1719,21 +698,21 @@ class DASProcessor:
         # 3. Locate files and metadata
         self.locate_event_data(event)
         if not self.files:
-            print(f"No files found for {event}. Execution aborted for this event.")
+            logger.error(f"No files found for {event}. Execution aborted for this event.")
             return False 
         
         # 4. Handle Stale GPS Logic
         # We check if the GPS status changed after looking at the file headers
         if self.acquisition_params.get("gps_status") == True:
             if self.sources.get(event, {}).get("GPS") == False:
-                print("GPS information was stale. Recalculating start times.")
+                logger.warning("GPS information was stale. Recalculating start times.")
                 figsize, self.datetime_start, self.duration = self.calculate_trim_times(event, station)
                 # Re-locate files with updated time
                 self.locate_event_data(event)
 
         # 5. Check if we found anything
         if not self.files:
-            print(f'No data available for event {event}. Skipping!')
+            logger.warning(f'No data available for event {event}. Skipping!')
             return False # Signal to the loop to continue
 
         # 6. Calculate Channels
@@ -1741,14 +720,13 @@ class DASProcessor:
 
         # Exit early if channels array is empty
         if self.channels.size == 0:  # Use .size for NumPy arrays
-            print(f"No valid channels found for event {event}. Exiting.")
+            logger.error(f"No valid channels found for event {event}. Exiting.")
             return False
 
         # 7. Final Load
         self.load_dfdas_file(event, replace_DAS=replace_DAS)
 
-        if self.exec_params.get("verbose"):
-            print(f"LOAD_EVENT_DATA: Event {event} loaded successfully with {len(self.channels)} channels.")
+        logger.debug(f"LOAD_EVENT_DATA: Event {event} loaded successfully with {len(self.channels)} channels.")
         
         return True # Success!
 
@@ -1761,8 +739,8 @@ class DASProcessor:
 
         self.event=event
 
-        print(f'Finding files for event: {event}')
-        print(f'Trying file list from {events_path}')
+        logger.info(f'Finding files for event: {event}')
+        logger.info(f'Trying file list from {events_path}')
 
         if os.path.exists(hdf5_file):
             self.files=[hdf5_file]
@@ -1779,11 +757,11 @@ class DASProcessor:
                 # Calculate overlap using the newly updated dictionary
                 ap["overlap"] = ap["roi_step"] * ap["dx"] / ap["gauge_length"]
         else:
-            print(f'Local HDF5 not found. Searching raw data in {experiment_path}')
+            logger.info(f'Local HDF5 not found. Searching raw data in {experiment_path}')
             date_start= self.datetime_start.strftime("%Y%m%d")
             target_path=Path(experiment_path) / date_start
             if not target_path.exists():
-                print(f"Skipping event {event} due to missing directories.")
+                logger.warning(f"Skipping event {event} due to missing directories.")
                 self.files = []
                 return self.files, 0, 0, 0
            
@@ -1850,35 +828,34 @@ class DASProcessor:
             end_time = einfo.get("end_time")
             start_time = einfo.get("start_time")
             einfo["window_duration"] = (end_time - start_time).total_seconds()
-            logging.warning(f"`window_duration` was not set for {event}. Calculated from `start_time` and `end_time`.")
-            if ep.get("verbose"):
-                print(f"`window_duration` was not set for {event}. Calculated from `start_time` and `end_time`.")
+            logger.warning(f"`window_duration` was not set for {event}. Calculated from `start_time` and `end_time`.")
+            logger.debug(f"`window_duration` was not set for {event}. Calculated from `start_time` and `end_time`.")
 
         if self.roi_step is None:
-            logging.warning("ROI step is not set. Attempting to retrieve from loaded data.")
+            logger.warning("ROI step is not set. Attempting to retrieve from loaded data.")
             self.roi_step = self.filemeta['demodSpec']['roiDec'][0]
             if self.roi_step is None:
-                logging.warning("ROI step could not be retrieved from current dfdas data."
+                logger.warning("ROI step could not be retrieved from current dfdas data."
                                  " Attempting to retrieve from files.")
                 experiment_path = self.path_params.get("experiment_path")
                 start_time = UTCDateTime(einfo.get("start_time")).datetime
                 self.get_roi_step(experiment_path, start_time)
             if self.roi_step is None:
-                logging.error("ROI step could not be determined. Please check the data files.")
+                logger.error("ROI step could not be determined. Please check the data files.")
                 raise ValueError("ROI step is not set and could not be retrieved from files.")
 
-        print(f'Processing event {event}, of the type {einfo.get("type")}')
-        logging.info(f'Processing event {event}, of the type {einfo.get("type")}')
-        print('Calculating trim times and figure sizes...')
-        logging.info('Calculating trim times and figure sizes.')
+        logger.info(f'Processing event {event}, of the type {einfo.get("type")}')
+        logger.info(f'Processing event {event}, of the type {einfo.get("type")}')
+        logger.info('Calculating trim times and figure sizes...')
+        logger.info('Calculating trim times and figure sizes.')
 
         # Determine clock offset based on GPS status stored in the class
         if ap.get("gps_status"):
             self.clock_offset = 0
         else:
             if self.clock_offset == 0:
-                logging.warning("No GPS timing reported, but clock was not corrected.")
-                print(f"No GPS timing reported, but clock was not corrected.\n"
+                logger.warning("No GPS timing reported, but clock was not corrected.")
+                logger.warning(f"No GPS timing reported, but clock was not corrected.\n"
                       f"Revise 'clock_offset' parameter in defaults.py")
 
         # Logic for Seismic vs Other types
@@ -1895,17 +872,17 @@ class DASProcessor:
             # Calculate start time with offset
             base_time = UTCDateTime(einfo.get("start_time"))
             trim_time = base_time + arrivals_p[0].time - einfo.get("window_in") + datetime.timedelta(seconds=self.clock_offset)
-            print(f'Time offset correction of {self.clock_offset}s applied.')
+            logger.info(f'Time offset correction of {self.clock_offset}s applied.')
         else:
             self.figsize = (10, 8)
             trim_time = UTCDateTime(einfo.get("start_time")) - einfo.get("window_in")
-            print("Time offset not corrected.")
+            logger.info("Time offset not corrected.")
 
         # Store results in the class instance
         self.datetime_start = trim_time.datetime
         self.duration = datetime.timedelta(seconds=einfo.get("window_duration") + einfo.get("window_in"))
 
-        print(f'Datetime start: {self.datetime_start}')
+        logger.info(f'Datetime start: {self.datetime_start}')
         return self.figsize, self.datetime_start, self.duration
 
     def trim_DAS_data(self, event):
@@ -1917,8 +894,8 @@ class DASProcessor:
         start_time = pd.to_datetime(self.event_info.get("start_time"))
 
         self.dfdas = self.dfdas.truncate(before=start_time - window_in, after=start_time + window_duration)
-        print('DAS data trimmed from ', start_time - window_in, ' to ', start_time + window_duration)
-        print('with a start time of ', start_time)
+        logger.info("%s %s %s %s", 'DAS data trimmed from ', start_time - window_in, ' to ', start_time + window_duration)
+        logger.info("%s %s", 'with a start time of ', start_time)
 
         return self.dfdas
 
@@ -1958,7 +935,7 @@ class DASProcessor:
                     self.files = [local_hdf5]
                     # This avoids channel re-numbering
                     ch_idx, samples = get_data_indexes(self.files[0])
-                    print(self.files[:])
+                    logger.debug("%s", self.files[:])
                     self.dfdas = load_DAS_files(self.files, ch_idx, samples, integrate=False)
                 except ValueError:
                     # Fallback to experiment path if local HDF5 fails
@@ -1978,28 +955,27 @@ class DASProcessor:
 
         # 2. Sanity check using acquisition_params (updated by previous methods)
         if einfo.get("GPS") and ap.get('gps_status') != 0:
-            print("Event defined as having locked GPS, but file header indicates otherwise.\nClock offset should be calculated.")
+            logger.warning("Event defined as having locked GPS, but file header indicates otherwise.\nClock offset should be calculated.")
 
-        if ep.get("verbose"):
-            print(f'chIndex: {ch_idx}')
-            print(f'columns: {self.dfdas.columns}')
+        logger.debug(f'chIndex: {ch_idx}')
+        logger.debug(f'columns: {self.dfdas.columns}')
 
         # 3. Store Metadata
         self.filemeta = get_filemeta(self.files[0], 2)
 
         # 3.1 update self.roi_step in case it was not set before
         if self.roi_step is None:
-            logging.warning("ROI step was not set upon loading. Retrieving from file metadata.")
+            logger.warning("ROI step was not set upon loading. Retrieving from file metadata.")
             self.roi_step = self.filemeta['demodSpec']['roiDec'][0]
             ap["roi_step"] = self.roi_step
 
         # 3.2 Update self.first_chan and self.last_chan if they were not set before
         if self.first_chan is None:
-            logging.warning("First channel was not set upon loading. Retrieving from file metadata.")
+            logger.warning("First channel was not set upon loading. Retrieving from file metadata.")
             self.first_chan = self.filemeta['header']['channels'][0]
             ap["first_chan"] = self.first_chan
         if self.last_chan is None:
-            logging.warning("Last channel was not set upon loading. Retrieving from file metadata.")
+            logger.warning("Last channel was not set upon loading. Retrieving from file metadata.")
             self.last_chan = self.filemeta['header']['channels'][-1]
             ap["last_chan"] = self.last_chan
 
@@ -2009,15 +985,15 @@ class DASProcessor:
             file_exists = os.path.exists(local_hdf5)
             
             if file_exists and not replace_DAS:
-                print(f'Local HDF5 already exists for event {event}. Skipping save.')
+                logger.info(f'Local HDF5 already exists for event {event}. Skipping save.')
             else:
                 if file_exists:
-                    print(f'Local HDF5 already exists for event {event}. Overwriting.')
+                    logger.info(f'Local HDF5 already exists for event {event}. Overwriting.')
 
                 filename_out = save_to_DAS_file(
                     self.dfdas, local_hdf5, "processed", **self.filemeta
                     )
-                print(f'Window for event {event} saved to {filename_out[0]}')
+                logger.info(f'Window for event {event} saved to {filename_out[0]}')
 
         # 5. populate offsets to make it easier to track channels in the DataFrame. This is useful for plotting and analysis.
         self.dfdas_offsets = self.dfdas.columns.to_numpy()
@@ -2035,7 +1011,7 @@ class DASProcessor:
         Returns a list of gap intervals if found.
         """
         if 't' not in self.dfdas.columns:
-            print("No 't' column found in DataFrame for gap checking.")
+            logger.warning("No 't' column found in DataFrame for gap checking.")
             return []
 
         time_diffs = self.dfdas['t'].diff().dropna()
@@ -2046,10 +1022,10 @@ class DASProcessor:
         gaps = time_diffs[time_diffs > gap_threshold]
 
         if not gaps.empty:
-            print(f"Warning: Detected {len(gaps)} gaps in the data exceeding {gap_threshold} seconds.")
+            logger.warning(f"Warning: Detected {len(gaps)} gaps in the data exceeding {gap_threshold} seconds.")
             return list(zip(gaps.index, gaps.values))
         else:
-            print("No significant gaps detected in the data.")
+            logger.info("No significant gaps detected in the data.")
             return []
 
     def save_dfdas_file(self, params=None):
@@ -2058,7 +1034,7 @@ class DASProcessor:
         Automatically constructs the path if 'filename' is not in params.
         """
         if self.dfdas is None:
-            print("No data in memory (self.dfdas) to save.")
+            logger.warning("No data in memory (self.dfdas) to save.")
             return
 
         # 1. Determine the filename
@@ -2086,9 +1062,9 @@ class DASProcessor:
                 "processed", 
                 **self.filemeta
             )
-            print(f"Data successfully saved to: {filename_out[0]}")
+            logger.info(f"Data successfully saved to: {filename_out[0]}")
         except Exception as e:
-            print(f"Error saving DFDAS file: {e}")
+            logger.error(f"Error saving DFDAS file: {e}")
 
     def plot_channel_map(self, offsets, original_offsets):
         """
@@ -2100,7 +1076,7 @@ class DASProcessor:
         - White (0): Nothing at this offset
         """
         if original_offsets is None or len(original_offsets) == 0 or offsets is None or len(offsets) == 0:
-            print("No valid offsets are available for plotting.")
+            logger.warning("No valid offsets are available for plotting.")
             return
 
         step = max(1, int(self.roi_step)) # symbol width to improve readability
@@ -2183,12 +1159,12 @@ class DASProcessor:
         Updates self.dfdas in place.
         """
 
-        logging.info(f"Extracting channel subset for offset range key: {offset_range_key}")
+        logger.info(f"Extracting channel subset for offset range key: {offset_range_key}")
 
         if offset_range_key not in self.offset_ranges:
-            print(f"Offset range key '{offset_range_key}' not found in offset_ranges.")
-            print(f"No changes made to dfdas.")
-            logging.warning(f"Offset range key '{offset_range_key}' not found in offset_ranges.")
+            logger.warning(f"Offset range key '{offset_range_key}' not found in offset_ranges.")
+            logger.warning(f"No changes made to dfdas.")
+            logger.warning(f"Offset range key '{offset_range_key}' not found in offset_ranges.")
             return
 
         #1. create the offsets array
@@ -2203,7 +1179,7 @@ class DASProcessor:
 
         #         
         if self.dfdas is None:
-            print("No data loaded in self.dfdas. Cannot extract channels.")
+            logger.warning("No data loaded in self.dfdas. Cannot extract channels.")
             return
 
         if self.dfdas_offsets is None:
@@ -2213,7 +1189,7 @@ class DASProcessor:
 
         subset_dfdas = self.dfdas.columns.intersection(offsets)
         if subset_dfdas.empty:
-            print("No matching channels found in self.dfdas for the provided offsets.")
+            logger.warning("No matching channels found in self.dfdas for the provided offsets.")
             return
 
         missing_channels= set(offsets) - set(subset_dfdas)
@@ -2221,10 +1197,10 @@ class DASProcessor:
             # create a map of missing channels to their corresponding offset ranges for better clarity
             plot_channel_map = self.plot_channel_map(offsets, original_offsets)
 
-            print(f"Warning: {len(missing_channels)} requested channels were not found in self.dfdas, and were skipped.")
-            print(f"Successfully extracted: {len(subset_dfdas)} channels.")
-            logging.warning(f"The following requested channels were not found in self.dfdas: {sorted(list(missing_channels))}")
-            logging.info(f"Successfully extracted: {len(subset_dfdas)} channels.")
+            logger.warning(f"Warning: {len(missing_channels)} requested channels were not found in self.dfdas, and were skipped.")
+            logger.info(f"Successfully extracted: {len(subset_dfdas)} channels.")
+            logger.warning(f"The following requested channels were not found in self.dfdas: {sorted(list(missing_channels))}")
+            logger.info(f"Successfully extracted: {len(subset_dfdas)} channels.")
 
         self.dfdas = self.dfdas[subset_dfdas]
         self.dfdas_offsets = self.dfdas.columns.to_numpy()
@@ -2239,7 +1215,7 @@ class DASProcessor:
         event_channel_ranges = self.event_info.get("channel_ranges")
 
         if not event_channel_ranges:
-            print(f"WARNING: 'channel_ranges' not specified for event '{event}'. Skipping channel calculation.")
+            logger.warning(f"WARNING: 'channel_ranges' not specified for event '{event}'. Skipping channel calculation.")
             self.channels = np.array([])
             return self.channels, [], [], [] #This will signal an error upstream
 
@@ -2261,7 +1237,7 @@ class DASProcessor:
         # Adjustment for non-zero first channel
         if self.first_chan != 0 and self.first_chan < self.roi_step:
             adjustment = self.first_chan - self.roi_step
-            print(f'Adjusting channels: {self.channels[0]} -> {self.channels[0] + adjustment}')
+            logger.info(f'Adjusting channels: {self.channels[0]} -> {self.channels[0] + adjustment}')
             self.channels = self.channels + adjustment
             
         return self.channels, self.min_channel, self.max_channel, self.channel_step
@@ -2272,7 +1248,7 @@ class DASProcessor:
         Uses 'csv_out_path' and appends the timelapse suffix.
         """
         if self.dfdas is None:
-            print("No data to save.")
+            logger.warning("No data to save.")
             return
 
         pp = self.path_params
@@ -2288,13 +1264,16 @@ class DASProcessor:
         full_path = os.path.join(csv_dir, filename)
 
         # 3. Export
-        print(f"»»» Saving CSV format to: {full_path}")
+        logger.info(f"»»» Saving CSV format to: {full_path}")
         # index=True includes the timestamps from the 't' axis created in decimation
         self.dfdas.to_csv(full_path, index=True, header=True)
 
 
-    def dfdas_to_mseed(self, event, write=False, format=None, dType=None, decimate=False,
-                       filename=None, stationXML=False, int_resolution='picostrain'):
+    def dfdas_to_mseed(
+        self, event: str, write: bool | str = False, format: str | None = None,
+        dType: str | None = None, decimate: bool = False, filename: str | None = None,
+        stationXML: bool = False, int_resolution: str = 'picostrain',
+    ) -> Stream | None:
         """
         Converts the stored self.dfdas (Pandas) into an ObsPy Stream object.
         Uses class attributes for metadata and configuration.
@@ -2303,7 +1282,7 @@ class DASProcessor:
         ep, ap, pp, th = self.exec_params, self.acquisition_params, self.path_params, self.trace_header[self.network]
 
         if self.dfdas is None:
-            print("No data loaded in self.dfdas. Run load_dfdas_file() first.")
+            logger.warning("No data loaded in self.dfdas. Run load_dfdas_file() first.")
             return None
 
         # reset decimation history for mseed output
@@ -2314,7 +1293,7 @@ class DASProcessor:
             if int_resolution not in INT32_SCALES:
                 raise ValueError(f"int_resolution must be one of {list(INT32_SCALES)}")
             scale = INT32_SCALES[int_resolution]
-            print(f"Scaling data by {scale:.0e} ({int_resolution}) for int32 MiniSEED.")
+            logger.info(f"Scaling data by {scale:.0e} ({int_resolution}) for int32 MiniSEED.")
             # Stop here, before any trace is built, if the data won't fit.
             check_int32_scaling(self.dfdas.to_numpy(), scale)
             self.stationxml_params["int32_resolution"] = int_resolution
@@ -2324,15 +1303,16 @@ class DASProcessor:
             self.stationxml_params.pop("int32_resolution", None)
 
         if dType == 'int':
-            print(f'Scaling data by a factor of {scale:.0e} to match int32 range for MSEED output.\nNew data type is {dType}.')
-        print(f'params: event:{event} write:{write} format:{format} dType:{dType} decimate:{decimate} filename:{filename}')
+            logger.info(f'Scaling data by a factor of {scale:.0e} to match int32 range for MSEED output.\nNew data type is {dType}.')
+        logger.debug(f'params: event:{event} write:{write} format:{format} dType:{dType} decimate:{decimate} filename:{filename}')
         if self.dfdas is None:
-            print("No data loaded in self.dfdas. Run load_dfdas_file() first.")
+            logger.warning("No data loaded in self.dfdas. Run load_dfdas_file() first.")
             return None
         else:
-            print("Converting to ObsPy Stream")
+            logger.info("Converting to ObsPy Stream")
 
         self.mseed_stream=Stream()
+        params = self.get_current_params()   # built once, not once per channel
         for channel in self.dfdas.columns[:]:
             tr = Trace()
             data = self.dfdas[channel].to_numpy().astype(float)  # Convert to dType. default is float.
@@ -2343,7 +1323,7 @@ class DASProcessor:
             station_code = str(int(channel*ap.get("dx"))).zfill(5)
             if ep.get("encode_station_name"):
                 tr.stats['decoded_station'] = station_code
-                tr.stats.station = encode_station_name(th.get("station_prefix"),station_code,self.get_current_params())
+                tr.stats.station = encode_station_name(th.get("station_prefix"),station_code,params)
             else:
                 tr.stats.station = station_code
             tr.stats.network = th['network']
@@ -2351,7 +1331,7 @@ class DASProcessor:
             tr.stats.mseed = th['mseed']
             tr.stats.channel = th['channel']
             tr.stats.distance = int(channel*self.dfdas.meta["dx"])
-            lat, long, ele = get_coordinates(channel, self.get_current_params(),roi_channel=False)
+            lat, long, ele = get_coordinates(channel, params, roi_channel=False)
             
             if ep.get("degrade_coordinates"):
                 lat,long=degrade_coordinates(lat,long,precision=ep.get("precision"),error_metres=ep.get("error_metres"))
@@ -2365,15 +1345,14 @@ class DASProcessor:
             self.mseed_stream=self.decimate_st()
 
         if stationXML:
-            if ep.get("verbose"):
-                print("Creating StationXML file for the current stream.")
+            logger.debug("Creating StationXML file for the current stream.")
             station_xml_creation(self.mseed_stream,self.get_current_params())   
 
         if write in ['stream', True]:
             mseed_filename = filename if filename else f'{event}_{self.mseed_stream[0].stats.sampling_rate}Hz.mseed'
             full_path = os.path.join(pp.get("MSEED_path"), mseed_filename)
             self.mseed_stream.write(full_path, format='MSEED')
-            print(f'Full stream written to {full_path}')
+            logger.info(f'Full stream written to {full_path}')
 
         elif write == 'channels':
             for tr in self.mseed_stream:
@@ -2398,10 +1377,10 @@ class DASProcessor:
             
                 full_path=os.path.join(mseed_path,mseed_filename)
                 tr.write(full_path, format='MSEED',reclen=512)#,encoding='STEIM1')
-                print(f'wrote file {full_path} julian_date={ep.get("julian_date")}')
+                logger.info(f'wrote file {full_path} julian_date={ep.get("julian_date")}')
 
         elif not write:
-            print("Stream created in memory. No files written.")
+            logger.info("Stream created in memory. No files written.")
 
         return self.mseed_stream
     
@@ -2410,10 +1389,10 @@ class DASProcessor:
         Cross-correlates all traces in self.dfdas and stores results in self.cross_correlation_results.
         """
         if self.dfdas is None:
-            print("No data is loaded. Run load_dfdas_file() first.")
+            logger.warning("No data is loaded. Run load_dfdas_file() first.")
             return None
         else:
-            print("Performing cross-correlation on self.dfdas.")
+            logger.info("Performing cross-correlation on self.dfdas.")
         
         if reference is None:
             num_channels = len(self.dfdas.columns)
@@ -2421,7 +1400,7 @@ class DASProcessor:
         else:
             reference= int(reference/self.roi_step) # Convert from channel number to index based on roi_step
             if reference >= len(self.dfdas.columns) or reference < -len(self.dfdas.columns):  # the negative index allows counting from the end, but it should still be within bounds
-                print(f"Reference channel index {reference} is out of bounds. Defaulting to middle channel.")
+                logger.warning(f"Reference channel index {reference} is out of bounds. Defaulting to middle channel.")
                 num_channels = len(self.dfdas.columns)
                 reference_idx = (num_channels - 1) // 2
             else:
@@ -2429,8 +1408,8 @@ class DASProcessor:
 
         reference_channel = self.dfdas.columns[reference_idx]
         channel_distance = int(reference_channel * self.dfdas.meta['dx'])
-        print(f"Using channel no. {reference_idx} as the reference channel for cross-correlation.")
-        print(f"Distance for reference channel: {channel_distance} metres.")
+        logger.info(f"Using channel no. {reference_idx} as the reference channel for cross-correlation.")
+        logger.info(f"Distance for reference channel: {channel_distance} metres.")
 
         self.cross_correlation_results = {}
 
@@ -2449,7 +1428,7 @@ class DASProcessor:
                 'correlation': corr[valid_indices],
                 'lags': trimmed_lags
             }
-        print(f"Cross-correlation completed with reference channel {reference_channel}.")
+        logger.info(f"Cross-correlation completed with reference channel {reference_channel}.")
         return self.cross_correlation_results
 
     def plot_cross_correlation_heatmap(self, vmin=None, vmax=None, cmap='RdBu_r'):
@@ -2457,7 +1436,7 @@ class DASProcessor:
         Plots all cross-correlation results as a 2D heatmap/waterfall plot.
         """
         if not hasattr(self, 'cross_correlation_results') or not self.cross_correlation_results:
-            print("No cross-correlation results found. Run cross_correlate() first.")
+            logger.warning("No cross-correlation results found. Run cross_correlate() first.")
             return
 
         # 1. Extract channels and sort them to ensure proper spatial ordering
@@ -2502,7 +1481,7 @@ class DASProcessor:
         Plots cross-correlation functions as line graphs for specific channels.
         """
         if not hasattr(self, 'cross_correlation_results') or not self.cross_correlation_results:
-            print("No cross-correlation results found.")
+            logger.warning("No cross-correlation results found.")
             return
 
         # If no channels are specified, just grab 3 evenly spaced ones
@@ -2542,16 +1521,16 @@ class DASProcessor:
         of that filter is recorded on the stream (stream.decimation_steps), so the
         history lives exactly as long as the stream does.
         """
-        ep, fp = self.exec_params, self.freq_params
+        fp = self.freq_params
 
         st = self.mseed_stream
         if st is None or len(st) == 0:
-            print("No ObsPy Stream found in memory. Run dfdas_to_mseed() first.")
+            logger.warning("No ObsPy Stream found in memory. Run dfdas_to_mseed() first.")
             return None
 
         for decimation in fp.get("decimation_factor"):
             fs = st[0].stats.sampling_rate
-            print(f'Decimation factor: {decimation}')
+            logger.info(f'Decimation factor: {decimation}')
             new_nyquist = fs / 2.0 / decimation
 
             # Same coefficients zerophase_chebyshev_lowpass_filter will use, so
@@ -2569,8 +1548,7 @@ class DASProcessor:
                     decimation, fs, fir=fir,
                     label="Zero-phase Chebyshev II (filtfilt) low-pass")]
 
-            if ep.get("verbose"):
-                print(st[0].stats.sampling_rate)
+            logger.debug("%s", st[0].stats.sampling_rate)
         return st
 
     def reduce_velocity_st(self, vred=5.0, offset=0):
@@ -2587,12 +1565,12 @@ class DASProcessor:
         Returns:
             The reduced-velocity copy of ``self.mseed_stream``.
         """
-        print(f'Reducing velocity to {vred} km/s with an offset of {offset} meters.')
+        logger.info(f'Reducing velocity to {vred} km/s with an offset of {offset} meters.')
 
         st=self.mseed_stream.copy()
         
         if offset != 0:
-            print(f'An offset of {offset} meters with be added to every distance.')
+            logger.info(f'An offset of {offset} meters with be added to every distance.')
 
         for tr in st:
             # apply a distance shift to match a specific feature
@@ -2617,7 +1595,7 @@ class DASProcessor:
         fp = self.freq_params
 
         if self.dfdas is None:
-            print("No data loaded.")
+            logger.warning("No data loaded.")
             return False
         
         # If factors are passed via process_chain, use them; 
@@ -2626,7 +1604,7 @@ class DASProcessor:
             factors = fp.get("decimation_factor", [])
         else:
             fp["decimation_factor"] = factors  # Update global_params if factors are passed directly
-            print(f"Default decimation factors updated to: {factors}")
+            logger.info(f"Default decimation factors updated to: {factors}")
         
         for decimation in factors:
              # 1. Current dimensions come from the data itself, not from meta
@@ -2668,7 +1646,7 @@ class DASProcessor:
 
              # Consistency check: metadata must match the new dimensions
              if tuple(self.dfdas.meta["dimensionSizes"]) != self.dfdas.shape:
-                 logging.warning(
+                 logger.warning(
                      f"dimensionSizes {tuple(self.dfdas.meta['dimensionSizes'])} "
                      f"!= data shape {self.dfdas.shape} after decimation.")
 
@@ -2677,7 +1655,7 @@ class DASProcessor:
                  decimation, fs_in, fir=fir,
                  label="Linear-phase FIR (Kaiser) low-pass"))
 
-             print(f"Decimated {nt_in} -> {nt_out} samples x {nx} channels; "
+             logger.info(f"Decimated {nt_in} -> {nt_out} samples x {nx} channels; "
                    f"new sampling rate: {1/dt_out} Hz")
 
              # CRITICAL: Clear the cached ObsPy stream because the underlying
@@ -2688,12 +1666,11 @@ class DASProcessor:
         return self.dfdas
             
     def plot_spectrogram(self, freq_type="no_filter", suffix=""):
-        ep = self.exec_params
         pp = self.path_params
         sfp = self.exec_params.get('spectrogram_freq_params', {})
 
         if self.mseed_stream is None:
-            print("No ObsPy Stream found in memory. Attempting to create from self.dfdas...")
+            logger.warning("No ObsPy Stream found in memory. Attempting to create from self.dfdas...")
             self.dfdas_to_mseed(self.event, write=False, format=None, dType=float, decimate=False)
 
         trace = self.mseed_stream[0].copy()  # Work with a copy to avoid modifying the original
@@ -2772,7 +1749,7 @@ class DASProcessor:
         if suffix:
             suffix = f"_{suffix}"
         filename=os.path.join(pp.get("figures_path"), f'{self.event}_fmin{fmin}_single_channel_spectrogram_dist-{trace.stats.distance}_{int((t[-1]+1)/3600)}h{suffix}')
-        print("saving figure to ",filename)
+        logger.info("%s %s", "saving figure to ", filename)
         distance_km = trace.stats.distance / 1000
         fig.suptitle(f'Spectrogram for channel at {distance_km:.3f} km', y=1.0)
         fig.savefig(filename+'.pdf',dpi=600, format='pdf', bbox_inches='tight', pad_inches=0.1)
@@ -2788,7 +1765,7 @@ class DASProcessor:
         Supports overrides for cmap, vmin, and vmax via params.
         """
         if self.dfdas is None:
-            print("No data in self.dfdas to plot.")
+            logger.warning("No data in self.dfdas to plot.")
             return
 
         # 1. Setup local references and shorthand
@@ -2805,8 +1782,8 @@ class DASProcessor:
         vmin = p.get("envelope_vmin", ep.get("envelope_vmin", .7))
         vmax = p.get("envelope_vmax", ep.get("envelope_vmax", 2))
 
-        print(f"»»» Running envelope (Cmap: {cmap}, Vmin: {vmin}, Vmax: {vmax})")
-        logging.info(f"»»» Running envelope (Cmap: {cmap}, Vmin: {vmin}, Vmax: {vmax})")
+        logger.info(f"»»» Running envelope (Cmap: {cmap}, Vmin: {vmin}, Vmax: {vmax})")
+        logger.info(f"»»» Running envelope (Cmap: {cmap}, Vmin: {vmin}, Vmax: {vmax})")
         # 1. Attempt to extract the real part; if it's a Stream object, this will fail.
         try:
             data = self.dfdas.real
@@ -2848,17 +1825,17 @@ class DASProcessor:
         filename = os.path.join(save_path, f"env_{self.event.replace(' ', '_')}")
         fig.savefig(f"{filename}.pdf", dpi=300, format='pdf', bbox_inches='tight')
         plt.close(fig)
-        print(f"Envelope plot saved as {filename}.pdf")
+        logger.info(f"Envelope plot saved as {filename}.pdf")
 
     def check_data_access(self, experiment_path, datetime_start):
         """
         Verifies that the experiment path and the date-specific 
         subfolder exist before attempting to read files.
         """
-        print(f"Checking data access in {experiment_path} for date {datetime_start.strftime('%Y-%m-%d')}")
+        logger.info(f"Checking data access in {experiment_path} for date {datetime_start.strftime('%Y-%m-%d')}")
         # 1. Check base path
         if not os.path.exists(experiment_path):
-            print(f"ERROR: Base path does not exist: {experiment_path}")
+            logger.error(f"ERROR: Base path does not exist: {experiment_path}")
             return False
 
         # 2. Check date-specific subfolder (SimpleDAS standard: path/YYYYMMDD)
@@ -2866,14 +1843,14 @@ class DASProcessor:
         date_path = os.path.join(experiment_path, date_str)
         
         if not os.path.exists(date_path):
-            print(f"ERROR: Date folder missing: {date_path}")
-            print("Check if the drive is mounted or if the event date is correct.")
+            logger.error(f"ERROR: Date folder missing: {date_path}")
+            logger.info("Check if the drive is mounted or if the event date is correct.")
             return False
 
         # 3. Check for data type subfolder (e.g., 'dphi')
         dphi_path = os.path.join(date_path, 'dphi')
         if not os.path.exists(dphi_path):
-             print(f"WARNING: 'dphi' folder not found in {date_path}. SimpleDAS might fail.")
+             logger.warning(f"WARNING: 'dphi' folder not found in {date_path}. SimpleDAS might fail.")
              return False
         
         return True
@@ -2890,11 +1867,11 @@ class DASProcessor:
         """
 
         if self.dfdas is None:
-            print("No data in memory to plot.")
+            logger.warning("No data in memory to plot.")
             return
 
         event = event or self.event
-        print(f"»»» Generating 2D Record Section for {event}...")
+        logger.info(f"»»» Generating 2D Record Section for {event}...")
 
         data = self.dfdas.to_numpy()
         dt = self.dfdas.meta['dt']
@@ -2910,14 +1887,14 @@ class DASProcessor:
         offsets_km = absolute_offsets_km[spatial_mask]
 
         if sub_data.shape[1] == 0:
-            print(f"ERROR: no channels in range {start_offset_km}-{end_offset_km} km.")
-            print(f"Available range: {absolute_offsets_km.min():.2f} - {absolute_offsets_km.max():.2f} km")
+            logger.error(f"ERROR: no channels in range {start_offset_km}-{end_offset_km} km.")
+            logger.info(f"Available range: {absolute_offsets_km.min():.2f} - {absolute_offsets_km.max():.2f} km")
             return
 
         time_mask = time_axis <= max_time_s
         sub_data = sub_data[time_mask, :]
         plot_time = time_axis[time_mask]
-        print(f"-> Data: {sub_data.shape[1]} channels, {sub_data.shape[0]} time samples")
+        logger.info(f"-> Data: {sub_data.shape[1]} channels, {sub_data.shape[0]} time samples")
 
         lowcut, highcut = 0.5, 20.0
         nyq = 0.5 * fs
@@ -2959,7 +1936,7 @@ class DASProcessor:
                         ax.text(end_offset_km - 0.2, t_val, label, color=color,
                                 fontsize=12, fontweight='bold', va='center', ha='right')
             except Exception as e:
-                print(f"Unable to calculate theoretical phases: {e}")
+                logger.error(f"Unable to calculate theoretical phases: {e}")
 
         ax.set_xlabel("Offset [km]", fontsize=12, fontweight='bold')
         ax.set_ylabel("Time [s]", fontsize=12, fontweight='bold')
@@ -2975,7 +1952,7 @@ class DASProcessor:
         event_safe = event.replace(" ", "_")
         filename = os.path.join(save_path, f"{event_safe}{suffix}_record_section_2d.png")
         fig.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"2D plot saved to: {filename}")
+        logger.info(f"2D plot saved to: {filename}")
         plt.show()
         plt.close(fig)
 
@@ -2986,11 +1963,11 @@ class DASProcessor:
         """
 
         if self.dfdas is None:
-            print("No data in memory to plot.")
+            logger.warning("No data in memory to plot.")
             return
 
         event = event or self.event
-        print(f"»»» Generating ZOOM Record Section for {event}...")
+        logger.info(f"»»» Generating ZOOM Record Section for {event}...")
 
         data = self.dfdas.to_numpy()
         dt = self.dfdas.meta['dt']
@@ -3057,7 +2034,7 @@ class DASProcessor:
                     ax2.axhline(y=s_rel, color='blue', linestyle='--', linewidth=1.5, alpha=0.7)
                     ax2.text(0.1, s_rel, 'S', color='blue', fontweight='bold')
             except Exception as e:
-                print(f"Error computing phases: {e}")
+                logger.error(f"Error computing phases: {e}")
 
         plt.tight_layout()
         pp = self.path_params
@@ -3066,7 +2043,7 @@ class DASProcessor:
             os.makedirs(save_path)
         filename = os.path.join(save_path, f"{event}_record_section_zoom.png")
         fig.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"Zoom plot saved to: {filename}")
+        logger.info(f"Zoom plot saved to: {filename}")
         plt.show()
         plt.close(fig)
 
@@ -3078,11 +2055,11 @@ class DASProcessor:
         Record section with wiggle traces, band-passed 0.5-20 Hz, with P/S/T phases.
         """
         if self.dfdas is None:
-            print("No data in memory to plot.")
+            logger.warning("No data in memory to plot.")
             return
 
         event = event or self.event
-        print(f"»»» Generating Record Section for {event}...")
+        logger.info(f"»»» Generating Record Section for {event}...")
 
         data = self.dfdas.to_numpy()
         dt = self.dfdas.meta['dt']
@@ -3096,7 +2073,7 @@ class DASProcessor:
         if end_offset_km is None:
             end_offset_km = start_offset_km + 21.5
 
-        print(f"-> Diagnostics: dx={dx_native:.4f} m/channel | dt={dt:.5f}s (fs={fs:.1f}Hz) | "
+        logger.info(f"-> Diagnostics: dx={dx_native:.4f} m/channel | dt={dt:.5f}s (fs={fs:.1f}Hz) | "
               f"available channel coverage: {absolute_offsets_km.min():.2f} - {absolute_offsets_km.max():.2f} km | "
               f"data window: {time_axis.min():.1f} - {time_axis.max():.1f} s | "
               f"window start (UTC): {window_start_utc}")
@@ -3106,7 +2083,7 @@ class DASProcessor:
         offsets_km = absolute_offsets_km[spatial_mask]
 
         if sub_data.shape[1] == 0:
-            print("ERROR: no channels in requested offset range.")
+            logger.error("ERROR: no channels in requested offset range.")
             return
 
         time_mask = time_axis <= max_time_s
@@ -3130,7 +2107,7 @@ class DASProcessor:
 
         final_data = sub_data[:, final_data_indices]
         final_offsets = np.array(final_offsets)
-        print(f"-> Plotting {final_data.shape[1]} traces (target spacing: {dx_meters} m).")
+        logger.info(f"-> Plotting {final_data.shape[1]} traces (target spacing: {dx_meters} m).")
 
         fig, ax = plt.subplots(figsize=(15, 8.5))
         max_deflection_km = trace_spacing_km * 0.45 * scale_factor
@@ -3196,10 +2173,10 @@ class DASProcessor:
                         ax.text(end_offset_km + 0.3, t_val, label, color='crimson',
                                 fontsize=10, fontweight='bold', va='center', ha='left')
                     else:
-                        print(f"WARNING: phase {label} at t={t_val} is outside the plotted window "
+                        logger.warning(f"WARNING: phase {label} at t={t_val} is outside the plotted window "
                               f"({plot_time.min():.1f}-{plot_time.max():.1f}s).")
             except Exception as e:
-                print(f"Unable to calculate theoretical phases: {e}")
+                logger.error(f"Unable to calculate theoretical phases: {e}")
 
         ax.set_xlim(start_offset_km, end_offset_km)
         ax.set_ylim(max_time_s, 0.0)
@@ -3219,7 +2196,7 @@ class DASProcessor:
         event_safe = event.replace(" ", "_")
         filename = os.path.join(save_path, f"{event_safe}_record_section.png")
         fig.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {filename}")
+        logger.info(f"Figure saved to: {filename}")
         plt.show()
         plt.close(fig)
 
@@ -3233,11 +2210,11 @@ class DASProcessor:
         """
 
         if self.dfdas is None:
-            print("No data in memory to plot.")
+            logger.warning("No data in memory to plot.")
             return
 
         event = event or self.event
-        print(f"»»» Generating ENHANCED Record Section for {event}...")
+        logger.info(f"»»» Generating ENHANCED Record Section for {event}...")
 
         data = self.dfdas.to_numpy()
         dt = self.dfdas.meta['dt']
@@ -3253,7 +2230,7 @@ class DASProcessor:
         offsets_km = absolute_offsets_km[spatial_mask]
 
         if sub_data.shape[1] == 0:
-            print("ERROR: no channels in the requested range.")
+            logger.error("ERROR: no channels in the requested range.")
             return
 
         time_mask = time_axis <= max_time_s
@@ -3361,7 +2338,7 @@ class DASProcessor:
                     ax3.axhline(y=t_rel, color='green', linestyle='--', linewidth=1.0, alpha=0.5)
                     ax3.text(0.1, t_rel, 'T', color='green', fontweight='bold')
             except Exception as e:
-                print(f"Error computing phases: {e}")
+                logger.error(f"Error computing phases: {e}")
 
         plt.suptitle(f"{event} - Seismic Record Section (M2.7 Desertas)", fontsize=14, fontweight='bold')
         plt.tight_layout()
@@ -3372,7 +2349,7 @@ class DASProcessor:
             os.makedirs(save_path)
         filename = os.path.join(save_path, f"{event}_enhanced_section.png")
         fig.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"Enhanced plot saved to: {filename}")
+        logger.info(f"Enhanced plot saved to: {filename}")
         plt.show()
         plt.close(fig)
 
@@ -3394,7 +2371,7 @@ class DASProcessor:
         try:
             from obspy.clients.fdsn import Client
         except Exception:
-            print("ObsPy FDSN client not available. Install ObsPy to enable downloads.")
+            logger.error("ObsPy FDSN client not available. Install ObsPy to enable downloads.")
             return None
 
         # Default EIDA node (can be changed later)
@@ -3405,7 +2382,7 @@ class DASProcessor:
         if station_code is None:
             station_code = input("Enter station code (e.g. ABCD): ").strip()
             if not station_code:
-                print("No station code provided. Aborting download.")
+                logger.error("No station code provided. Aborting download.")
                 return None
 
         # Ask for network if not provided
@@ -3419,7 +2396,7 @@ class DASProcessor:
             try:
                 starttime = UTCDateTime(s)
             except Exception as e:
-                print(f"Invalid start time: {e}")
+                logger.error(f"Invalid start time: {e}")
                 return None
         else:
             starttime = UTCDateTime(starttime)
@@ -3429,7 +2406,7 @@ class DASProcessor:
             try:
                 endtime = UTCDateTime(e)
             except Exception as ex:
-                print(f"Invalid end time: {ex}")
+                logger.error(f"Invalid end time: {ex}")
                 return None
         else:
             endtime = UTCDateTime(endtime)
@@ -3437,11 +2414,11 @@ class DASProcessor:
         # Instantiate client and fetch waveforms
         try:
             client = Client(base_url=eida_url)
-            print(f"Connecting to EIDA node: {eida_url}")
+            logger.info(f"Connecting to EIDA node: {eida_url}")
             st = client.get_waveforms(network, station_code, location, channel, starttime, endtime)
-            print(f"Downloaded {len(st)} trace(s) for {station_code} from {starttime} to {endtime}.")
+            logger.info(f"Downloaded {len(st)} trace(s) for {station_code} from {starttime} to {endtime}.")
         except Exception as err:
-            print(f"Error downloading data from EIDA: {err}")
+            logger.error(f"Error downloading data from EIDA: {err}")
             return None
 
         # Store stream on instance
@@ -3475,10 +2452,10 @@ class DASProcessor:
         so no meshgrid arrays are built.
         """
         if self.dfdas is None:
-            print("No data loaded; nothing to filter.")
+            logger.warning("No data loaded; nothing to filter.")
             return None
 
-        print(f"Applying FK filter with vmin={vmin}, vmax={vmax}, taper={taper}.")
+        logger.info(f"Applying FK filter with vmin={vmin}, vmax={vmax}, taper={taper}.")
 
         dt = self.dfdas.meta['dt']
         dx = self.dfdas.meta['dx']
@@ -3538,7 +2515,7 @@ class DASProcessor:
         event_info = self.sources.get(event, {})
         station=ep["station"]
     
-        print("Plotting record section.")
+        logger.info("Plotting record section.")
         result=subprocess.run(["bash","./plot_GMTmap.sh",
                                       str(event_info.get("longitude")),
                                       str(event_info.get("latitude")),
@@ -3553,23 +2530,18 @@ class DASProcessor:
                                      self.station_coordinates.get(station)["longitude"])
         if dist_az_baz[0]<100000:
             local = True
-            logging.info("Distance to event is less than 100 km. Considering it a local event for plotting.")
+            logger.info("Distance to event is less than 100 km. Considering it a local event for plotting.")
         else:
             local = False
-            logging.info("Distance to event is greater than 100 km. Considering it a regional/teleseismic event.")
+            logger.info("Distance to event is greater than 100 km. Considering it a regional/teleseismic event.")
 
         if ep.get("verbose"):
-            # Print the standard output and standard error
-            print("Standard Output:")
-            print(result.stdout)
-            print("\nStandard Error:")
-            print(result.stderr)
-            
-            # Check the return code
+            logger.debug("Standard output:\n%s", result.stdout)
+            logger.debug("Standard error:\n%s", result.stderr)
             if result.returncode == 0:
-                print("Bash script executed successfully.")
+                logger.debug("Bash script executed successfully.")
             else:
-                print(f"Bash script returned an error (return code {result.returncode}).")
+                logger.warning("Bash script returned an error (return code %d).", result.returncode)
     
         plt.rcParams['figure.dpi'] = 1200
         fig=plt.figure(clear=True,figsize=(10,6))
@@ -3627,11 +2599,11 @@ class DASProcessor:
             # Keep time as float offset (seconds)
             arr.time = round(arr.time, 3)
             # Print absolute arrival time
-            print(arr.name, event_time + arr.time)
+            logger.debug("%s %s", arr.name, event_time + arr.time)
             # Normalise relative arrival time
             arr.time -= p_time
             # Print updated absolute arrival time
-            print(arr.name, event_time + arr.time)
+            logger.debug("%s %s", arr.name, event_time + arr.time)
     
         # get DAS data
 
@@ -3661,7 +2633,7 @@ class DASProcessor:
 
         # If conversion didn't produce a Stream, bail out
         if st is None:
-            print("No Stream available for plotting.")
+            logger.warning("No Stream available for plotting.")
             return
 
         st.filter("bandpass", freqmin=min_freq, freqmax=max_freq, corners=4, zerophase=True)
@@ -3686,7 +2658,7 @@ class DASProcessor:
     
         st_event=Stream()
         if ep.get("plot_land_station"):
-            print(f'Getting channels {station_coordinates.get(station,{}).get("channels")} from {ep.get("land_station")}')
+            logger.info(f'Getting channels {station_coordinates.get(station,{}).get("channels")} from {ep.get("land_station")}')
             if "MSEED_file" in self.sources.get(event,{}):
                 st_land=read(os.path.join(pp.get("MSEED_path", ""),self.sources.get(event, {}).get("MSEED_file", "")))
             else:
@@ -3696,42 +2668,42 @@ class DASProcessor:
         
         if len(st_event)>0:
             if start_trim_time<st_event[0].stats.starttime-0.01:
-                print(f'{st_event[0].stats.station}.{st_event[0].stats.channel} has not enough data before the event.')
-                print(f'{st_event[0].stats.starttime}>{start_trim_time} diff={start_trim_time-st_event[0].stats.starttime}')
+                logger.warning(f'{st_event[0].stats.station}.{st_event[0].stats.channel} has not enough data before the event.')
+                logger.info(f'{st_event[0].stats.starttime}>{start_trim_time} diff={start_trim_time-st_event[0].stats.starttime}')
                 # window_correction=start_trim_time-st_event[0].stats.starttime
                 # sources.get(event, {})["window_in"] = sources.get(event, {}).get("window_in")+window_correction
                 # re_trim=True
             if end_trim_time<st_event[0].stats.endtime-0.01:
-                print(f'{st_event[0].stats.station}.{st_event[0].stats.channel} has not enough data after the event.')
-                print(f'{st_event[0].stats.endtime}>{end_trim_time} diff={end_trim_time-st_event[0].stats.endtime}')
+                logger.warning(f'{st_event[0].stats.station}.{st_event[0].stats.channel} has not enough data after the event.')
+                logger.info(f'{st_event[0].stats.endtime}>{end_trim_time} diff={end_trim_time-st_event[0].stats.endtime}')
                 # window_correction=end_trim_time-st_event[0].stats.endtime
                 # sources.get(event, {})["window_out"] = sources.get(event, {}).get("window_out")+window_correction
             # re_trim=True
         else:
-            print(f'The selected channel ({station_coordinates.get(station,{}).get("channels")}) doesn\'t exist in {os.path.join(pp.get("MSEED_path", ""),self.sources.get(event, {}).get("MSEED_file", ""))}.')
+            logger.warning(f'The selected channel ({station_coordinates.get(station,{}).get("channels")}) doesn\'t exist in {os.path.join(pp.get("MSEED_path", ""),self.sources.get(event, {}).get("MSEED_file", ""))}.')
             # Try to download land station data from a configured EIDA node if available
             try:
-                print("Attempting to download land station data from configured EIDA node...")
+                logger.info("Attempting to download land station data from configured EIDA node...")
                 st_dl = self.download_waveform_data(station_code=station, starttime=start_trim_time, endtime=end_trim_time)
                 if st_dl is not None and len(st_dl) > 0:
                     # Select requested channels and trim to window
                     try:
                         st_event = st_dl.select(channel=station_coordinates.get(station, {}).get("channels"), station=station)
                         st_event.trim(starttime=start_trim_time, endtime=end_trim_time)
-                        print(f"Successfully downloaded and trimmed data for station {station}.")
+                        logger.info(f"Successfully downloaded and trimmed data for station {station}.")
                     except Exception as e:
-                        print(f"Downloaded data present but required channels not found: {e}")
+                        logger.warning(f"Downloaded data present but required channels not found: {e}")
                 else:
-                    print("No data returned from EIDA for the requested interval/station.")
+                    logger.warning("No data returned from EIDA for the requested interval/station.")
             except Exception as e:
-                print(f"EIDA download attempt failed: {e}")
+                logger.error(f"EIDA download attempt failed: {e}")
     
         if len(st_event)>0:
             unique_phases=[]
             st_event.detrend()
             st_event.taper(max_percentage=0.05, type='hann')
             st_event.filter("bandpass", freqmin=fp.get("land_station_min_freq"), freqmax=fp.get("land_station_max_freq"), corners=8, zerophase=True)
-            print(f'Land stations bandpass filtered between {fp.get("land_station_min_freq")} and {fp.get("land_station_max_freq")} Hz')
+            logger.info(f'Land stations bandpass filtered between {fp.get("land_station_min_freq")} and {fp.get("land_station_max_freq")} Hz')
             ylim=(round(max(abs(st_event[0].data))/5)+1)*5
     
             if len(st_event)>3:
@@ -3772,7 +2744,7 @@ class DASProcessor:
                 ax1[idx].margins(0, 0)
                 ax2[idx].margins(0, 0)
                 ax1[idx].invert_yaxis()
-                print(f'Adding {event_channel.stats.station}-{event_channel.stats.channel}')
+                logger.info(f'Adding {event_channel.stats.station}-{event_channel.stats.channel}')
                 if event_channel.stats.station=="DAS":
                     ax1[idx].set_xlim(-ylim_stack, ylim_stack)
                     ax1[idx].set_title(f'{event_channel.stats.station}-{event_channel.stats.location}')
@@ -3792,13 +2764,11 @@ class DASProcessor:
                     if arr.time > prev+label_space and arr.time < time_delta:
                         prev=arr.time
                         plot_time=mdates.date2num(UTCDateTime(self.sources.get(event, {}).get("time"))+arr.time)
-                        if ep.get("verbose"):
-                            print("UNIQUE ARRIVAL",arr.name,arr.time,plot_time,UTCDateTime(self.sources.get(event, {}).get("time"))+arr.time)
+                        logger.debug("%s %s %s %s %s", "UNIQUE ARRIVAL", arr.name, arr.time, plot_time, UTCDateTime(self.sources.get(event, {}).get("time"))+arr.time)
                         ax2[0].axhline(y=plot_time, color='red')
                         ax2[0].annotate(arr.name, xy=(ylim*0.9, plot_time), xytext=(-100, 0),
                                     textcoords='offset pixels')
-            if ep.get("verbose"):
-                print("Unique arrivals",unique_phases)
+            logger.debug("%s %s", "Unique arrivals", unique_phases)
             
         ax0 = fig.add_subplot(gs[0])
     
@@ -3816,7 +2786,7 @@ class DASProcessor:
                                                 phase_list=('p','sP','s','P','PP','S','SS','SKS'),
                                                 ray_param_tol=0.1)
 
-            print(event_info["start_time"],arrivals[0],self.clock_offset)
+            logger.debug("%s %s %s", event_info["start_time"], arrivals[0], self.clock_offset)
             pdiff_time=UTCDateTime(event_info.get("start_time"))+arrivals[0].time+datetime.timedelta(seconds=self.clock_offset)
             start_trim_time=pdiff_time-datetime.timedelta(seconds=event_info.get("window_in"))
         
@@ -3851,8 +2821,7 @@ class DASProcessor:
         prev=0
         annot=""
         label_space = 1 if local else 10
-        if ep.get("verbose"): 
-            print("LABEL SPACE:",local,label_space)
+        logger.debug("%s %s %s", "LABEL SPACE:", local, label_space)
     
         for name, data in offset_traveltime_arrival.items():
             x=[point[0] for point in data]
@@ -3873,349 +2842,51 @@ class DASProcessor:
         plt.show()
         plt.close()
     
-        print(f'Interspace spacing={st_every_other[1].stats.distance-st_every_other[0].stats.distance} from {st_every_other[0].stats.distance} to {st_every_other[-1].stats.distance}. {len(st_every_other)} traces.')
-        print("Finished plotting record section.")
+        logger.debug(f'Interspace spacing={st_every_other[1].stats.distance-st_every_other[0].stats.distance} from {st_every_other[0].stats.distance} to {st_every_other[-1].stats.distance}. {len(st_every_other)} traces.')
+        logger.info("Finished plotting record section.")
 
-    @staticmethod
-    def _whale_bandpass(x, fs, lo, hi, order=4):
-        from scipy.signal import butter, filtfilt
 
-        nyq = 0.5 * fs
-        lo = max(0.001, float(lo))
-        hi = min(float(hi), nyq * 0.99)
-        b, a = butter(order, [lo / nyq, hi / nyq], btype="band")
-        return filtfilt(b, a, x)
+    def _resolve_whale_stream(
+        self, event: str | Stream | Trace | None, stream: Stream | Trace | None
+    ) -> Stream | Trace:
+        """Pick the data to analyse, without touching self.mseed_stream when the
+        caller supplies one.
 
-    @staticmethod
-    def _whale_rms(x):
-        x = np.asarray(x, dtype=float)
-        return np.sqrt(np.mean(x**2))
-
-    @staticmethod
-    def _whale_print_stats(name, values, fmt="{:.3f}"):
-        values = np.asarray(values, dtype=float)
-        values = values[np.isfinite(values)]
-        if values.size == 0:
-            print(f"{name} Mean:    n/a")
-            print(f"{name} Median:  n/a")
-            print(f"{name} Std:     n/a")
-            print(f"{name} min:     n/a")
-            print(f"{name} max:     n/a")
-            return
-        print(f"{name} Mean:    " + fmt.format(np.mean(values)))
-        print(f"{name} Median:  " + fmt.format(np.median(values)))
-        print(f"{name} Std:     " + fmt.format(np.std(values)))
-        print(f"{name} min:     " + fmt.format(np.min(values)))
-        print(f"{name} max:     " + fmt.format(np.max(values)))
-
-    @staticmethod
-    def _whale_centers_to_edges(c, start=None, end=None):
-        c = np.asarray(c, dtype=float)
-        if len(c) == 1:
-            if start is None:
-                start = c[0] - 0.5
-            if end is None:
-                end = c[0] + 0.5
-            return np.array([start, end], dtype=float)
-
-        edges = np.empty(len(c) + 1, dtype=float)
-        edges[1:-1] = 0.5 * (c[:-1] + c[1:])
-        if start is None:
-            start = c[0] - 0.5 * (c[1] - c[0])
-        if end is None:
-            end = c[-1] + 0.5 * (c[-1] - c[-2])
-        edges[0] = start
-        edges[-1] = end
-        return edges
-
-    def _prepare_whale_template(self, template, template_fs, fs, search_win_sec):
-        from scipy.signal import resample_poly
-
-        tpl = np.loadtxt(template).astype(np.float64)
-        tpl -= tpl.mean()
-        if template_fs != fs:
-            tpl = resample_poly(
-                tpl,
-                up=int(round(fs)),
-                down=int(round(template_fs))
-            ).astype(np.float64)
-            tpl -= tpl.mean()
-
-        n_tpl = len(tpl)
-        pulse_width = (n_tpl - 1) / fs
-        half_pulse_samp = int(round(0.5 * pulse_width * fs))
-        n_search_window = int(round(search_win_sec * fs))
-        tpl_plus = np.concatenate([np.zeros(n_tpl), tpl, np.zeros(n_tpl)])
-        return tpl, tpl_plus, n_tpl, half_pulse_samp, n_search_window
-
-    def _whale_auto_choose_channel(self, stream, band_detect):
-        peaks = []
-        for tr in stream:
-            x_raw = tr.data.astype(np.float64)
-            fs = float(tr.stats.sampling_rate)
-            x_det = self._whale_bandpass(x_raw, fs, *band_detect)
-            peaks.append(np.nanmax(np.abs(x_det)))
-        return int(np.nanargmax(peaks))
-
-    def _setup_whale_detection(self, event, species, template, template_fs):
-        if self.mseed_stream is None or len(self.mseed_stream) == 0:
-            logging.info("Stream  is empty.")
-            self.mseed_stream = self.dfdas_to_mseed(event, write=False)
-
-        if template is None and species is None:
-            logging.error("No template or species defined.")
-            logging.info("Please check the input parameters and try again.")
-            raise ValueError("No template or species defined.")
-
-        if template is None:
-            species_lower = species.lower()
-            if species_lower in ("blue", "fin", "humpback", "sei", "minke"):
-                template = f"{species_lower.upper()}_{template_fs}Hz.txt"
-            else:
-                logging.error(f"Unknown species: {species}")
-                logging.info("Please check the species name and try again.")
-                raise ValueError(f"Unknown species: {species}")
-
-        if not os.path.exists(template):
-            logging.error(f"Template file {template} not found")
-            logging.info("Please check the file path and try again.")
-            init_whale_templates()
-            raise FileNotFoundError(
-                f"Template file {template} not found. Default templates have been initialized in the current directory.\n"
-                "Please check the file path and try again."
-            )
-        return template
-
-    def _select_whale_indices(self, stream, detection_mode, channel_idx, band_detect):
-        if detection_mode not in ("single", "auto", "all"):
-            raise ValueError("DETECTION_MODE must be 'single', 'auto', or 'all'")
-        if detection_mode == "single":
-            if channel_idx is None:
-                raise ValueError("Set CHANNEL_IDX when DETECTION_MODE = 'single'")
-            if channel_idx < 0 or channel_idx >= len(stream):
-                raise IndexError(f"CHANNEL_IDX out of range: {channel_idx}")
-            return [channel_idx]
-        if detection_mode == "auto":
-            return [self._whale_auto_choose_channel(stream, band_detect)]
-        return list(range(len(stream)))
-
-    def _process_whale_trace(self, tr, idx, template, template_fs, band_detect,
-                             env_win, thresh, min_dist, search_win_sec, corr_thresh):
-        from scipy.signal import find_peaks
-        from obspy.signal.cross_correlation import correlate as obspy_cc
-        from datetime import timedelta
-
-        x_raw = tr.data.astype(np.float64)
-        fs = float(tr.stats.sampling_rate)
-        start_time = tr.stats.starttime.datetime
-        station = getattr(tr.stats, "station", "")
-        channel_label = station if station else f"channel_{idx}"
-
-        tpl, tpl_plus, n_tpl, half_pulse_samp, n_search_window = \
-            self._prepare_whale_template(template, template_fs, fs, search_win_sec)
-        x_det = self._whale_bandpass(x_raw, fs, *band_detect)
-        env = np.abs(x_det)
-        win_n = max(1, int(env_win * fs))
-        amp_smooth = np.convolve(env, np.ones(win_n) / win_n, mode="same")
-        thr = thresh * np.median(env)
-        dist = max(1, int(min_dist * fs))
-        raw_picks, _ = find_peaks(amp_smooth, height=thr, distance=dist)
-
-        results = []
-        for p in raw_picks:
-            approx_start = max(0, p - half_pulse_samp)
-            i0 = approx_start - n_tpl
-            i1 = approx_start + 2 * n_tpl
-            if i0 < 0 or i1 > len(x_det):
-                continue
-            st2 = x_det[i0:i1]
-            if len(st2) != len(tpl_plus):
-                continue
-
-            cc = obspy_cc(st2, tpl_plus, n_search_window,
-                          normalize="naive", method="direct", demean=True)
-            i_max = int(np.argmax(cc))
-            master_corr = float(np.max(cc))
-            master_shift = (i_max - n_search_window) / fs
-            if master_corr < corr_thresh:
-                continue
-
-            refined_start = approx_start + (i_max - n_search_window)
-            sig0 = refined_start
-            sig1 = refined_start + n_tpl
-            noi0 = refined_start - n_tpl
-            noi1 = refined_start
-            if noi0 < 0 or sig1 > len(x_det):
-                continue
-
-            signal_win = x_det[sig0:sig1]
-            noise_win = x_det[noi0:noi1]
-            amp_max = float(np.max(np.abs(signal_win)))
-            signal_rms = float(self._whale_rms(signal_win))
-            noise_rms = float(self._whale_rms(noise_win))
-            snr = np.nan if noise_rms == 0 else signal_rms / noise_rms
-            tsec = refined_start / fs
-            abs_time = start_time + timedelta(seconds=float(tsec))
-            results.append({
-                "sample": int(refined_start),
-                "time_s": float(tsec),
-                "datetime": abs_time,
-                "corr": float(master_corr),
-                "shift_s": float(master_shift),
-                "amp_max": float(amp_max),
-                "signal_rms": float(signal_rms),
-                "noise_rms": float(noise_rms),
-                "snr": float(snr),
-            })
-
-        return {
-            "idx": idx, "label": channel_label, "fs": fs,
-            "start_time": start_time, "x_raw": x_raw, "x_det": x_det,
-            "amp_smooth": amp_smooth, "thr": thr,
-            "raw_picks": raw_picks, "results": results,
-        }
-
-    @staticmethod
-    def _choose_whale_plot_result(processed):
-        if len(processed) == 1:
-            return processed[0]
-        kept_counts = [len(p["results"]) for p in processed]
-        if np.max(kept_counts) > 0:
-            return processed[int(np.argmax(kept_counts))]
-        raw_counts = [len(p["raw_picks"]) for p in processed]
-        return processed[int(np.argmax(raw_counts))]
-
-    def _report_whale_detections(self, detection_mode, processed, all_results,
-                                 band_detect, env_win):
-        if detection_mode in ("single", "auto"):
-            p = processed[0]
-            print(f"Detection mode       : {detection_mode}")
-            print(f"Chosen channel index : {p['idx']}")
-            print(f"Chosen channel label : {p['label']}")
-            print(f"Sampling rate        : {p['fs']:.1f} Hz")
-            print(f"Frequency BW         : {band_detect} Hz")
-            print(f"ENV_WIN              : {env_win} s")
-            print(f"Raw picks            : {len(p['raw_picks'])}")
-            print(f"Kept detections      : {len(p['results'])}")
-
-            for i, rec in enumerate(p["results"], start=1):
-                print(
-                    f"{i:02d} | t = {rec['time_s']:7.2f} s | {rec['datetime']} | "
-                    f"Cmax = {rec['corr']:.3f} | Shift = {rec['shift_s']:.3f} s | "
-                    f"Amp = {rec['amp_max']:.3f} | Signal RMS = {rec['signal_rms']:.3f} | "
-                    f"Noise RMS = {rec['noise_rms']:.3f} | SNR = {rec['snr']:.2f}"
-                )
-        else:
-            print(f"Detection mode       : {detection_mode}")
-            print(f"Processed channels   : {len(processed)}")
-            print(f"Frequency BW         : {band_detect} Hz")
-            print(f"ENV_WIN              : {env_win} s")
-            print()
-
-            nonzero = [
-                p for p in processed
-                if len(p["raw_picks"]) > 0 or len(p["results"]) > 0
-            ]
-            print(f"Channels with picks  : {len(nonzero)}")
-            print(f"Total kept detections: {len(all_results)}")
-            print()
-            for p in nonzero:
-                print(
-                    f"idx={p['idx']:5d} | label={p['label']} | "
-                    f"raw={len(p['raw_picks']):3d} | kept={len(p['results']):3d}"
-                )
-
-        print("*******************************")
-        print(f"Number of lines found {len(all_results)}")
-        if len(all_results) > 0:
-            cmax_arr = [r["corr"] for r in all_results]
-            shift_arr = [r["shift_s"] for r in all_results]
-            snr_arr = [r["snr"] for r in all_results]
-
-            self._whale_print_stats("Cmax", cmax_arr, "{:.3f}")
-            print()
-            self._whale_print_stats("Shift", shift_arr, "{:.3f}")
-            print()
-            self._whale_print_stats("SNR", snr_arr, "{:.3f}")
-
-    def _plot_whale_detections(self, plot_result, spec_source, spec_fmin,
-                               spec_fmax, spec_nperseg, spec_noverlap,
-                               spec_nfft, spec_dr, cmap):
-        from scipy.signal import spectrogram
-
-        picks = np.array(
-            [rec["sample"] for rec in plot_result["results"]], dtype=int
-        )
-        raw_picks = plot_result["raw_picks"]
-        amp_smooth = plot_result["amp_smooth"]
-        thr = plot_result["thr"]
-        fs = plot_result["fs"]
-        x_raw = plot_result["x_raw"]
-        x_det = plot_result["x_det"]
-        channel_label = plot_result["label"]
-        channel_idx = plot_result["idx"]
-        start_time = plot_result["start_time"]
-
-        t = np.arange(len(amp_smooth)) / fs
-        x_spec = x_raw if spec_source == "raw" else x_det
-        f, tt, Sxx = spectrogram(
-            x_spec, fs=fs, window="hann", nperseg=spec_nperseg,
-            noverlap=spec_noverlap, nfft=spec_nfft, detrend=False,
-            scaling="spectrum", mode="magnitude"
-        )
-        Sxx_db = 20 * np.log10(Sxx + 1e-12)
-        sel = (f >= spec_fmin) & (f <= spec_fmax)
-        duration = len(x_spec) / fs
-        t_edges = self._whale_centers_to_edges(tt, start=0.0, end=duration)
-        f_sel = f[sel]
-        f_edges = self._whale_centers_to_edges(f_sel)
-        vmax = np.percentile(Sxx_db[sel, :], 99.9)
-        vmin = vmax - spec_dr
-
-        fig, (ax0, ax1) = plt.subplots(
-            2, 1, figsize=(12, 6), sharex=True,
-            gridspec_kw={"height_ratios": [1, 2]}
-        )
-        fig.subplots_adjust(right=0.80, hspace=0.10)
-        ax0.plot(t, amp_smooth, lw=1.0, color="black",
-                 label="Smoothed amplitude")
-        ax0.axhline(thr, color="red", ls="--", lw=1.0,
-                    label="Amplitude threshold")
-        if len(raw_picks):
-            ax0.plot(
-                raw_picks / fs, amp_smooth[raw_picks],
-                "o", ms=4, mfc="none", mec="orange", label="Raw picks"
-            )
-        ax0.set_ylabel("Amplitude")
-        ax0.set_title(
-            f"Channel {channel_idx} ({channel_label}) | start = {start_time}"
-        )
-        ax0.set_xlim(0, duration)
-        ax0.legend(
-            loc="upper left", bbox_to_anchor=(1.01, 1.0),
-            borderaxespad=0.0, frameon=False
-        )
-        ax1.pcolormesh(
-            t_edges, f_edges, Sxx_db[sel, :],
-            shading="flat", cmap=cmap, vmin=vmin, vmax=vmax
-        )
-        ax1.set_ylim(spec_fmin, spec_fmax)
-        ax1.set_xlim(0, duration)
-        ax1.set_ylabel("Frequency (Hz)")
-        ax1.set_xlabel("Time (s)")
-        for p in picks:
-            ax1.axvline(p / fs, color="white", ls="--", lw=1.0, alpha=0.9)
-        plt.setp(ax0.get_xticklabels(), visible=False)
-        plt.savefig("Whale_detector.png", bbox_inches="tight", pad_inches=0)
-        plt.show()
-        plt.close()
-
-    def baleen_whale_detector(self, event, species=None, template=None, template_fs=100, detection_mode='single', channel_idx=None,\
-                              band_detect=(15,25), env_win=0.2, thresh=4.5, min_dist= 8.0, search_win_sec= 1.0, corr_thresh= 0.15,\
-                              spec_source="raw", spec_fmin=10, spec_fmax=40, spec_nperseg=1042, spec_noverlap=900, spec_nfft=2048,\
-                              spec_dr=15, cmap="jet"):
+        Priority: an explicit ``stream`` (or a Stream/Trace passed as ``event``),
+        then the already-loaded self.mseed_stream, then a new stream built from
+        ``event``. Validation of the stream itself is done by the detector.
         """
-        Detect template-matched baleen whale calls in the event's DAS data.
+        if stream is None and isinstance(event, (Stream, Trace)):
+            stream, event = event, None
+        if stream is not None:
+            return stream
+
+        if self.mseed_stream is None or len(self.mseed_stream) == 0:
+            if event is None:
+                raise ValueError(
+                    "No data to analyse: pass a Stream (stream=...) or an event key.")
+            logger.info("Stream is empty; building it from event %s.", event)
+            self.mseed_stream = self.dfdas_to_mseed(event, write=False)
+            if self.mseed_stream is None or len(self.mseed_stream) == 0:
+                raise ValueError(f"Could not build a stream for event {event!r}.")
+        return self.mseed_stream
+
+
+    def baleen_whale_detector(
+        self, event: str | None = None, species: str | None = None,
+        template: str | None = None, template_fs: float = 100,
+        detection_mode: str = 'single', channel_idx: int | None = None,
+        band_detect: tuple[float, float] = (15, 25), env_win: float = 0.2,
+        thresh: float = 4.5, min_dist: float = 8.0, search_win_sec: float = 1.0,
+        corr_thresh: float = 0.15, spec_source: str = "raw",
+        spec_fmin: float = 10, spec_fmax: float = 40, spec_nperseg: int = 1042,
+        spec_noverlap: int = 900, spec_nfft: int = 2048, spec_dr: float = 15,
+        cmap: str = "jet", stream: Stream | Trace | None = None,
+        report: bool = True, plot: bool = True,
+        save_path: str | os.PathLike | None = "Whale_detector.png", show: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Detect template-matched baleen whale calls in DAS data.
 
         When ``template`` is omitted, the bundled whale templates are initialized
         in the current directory and ``species`` selects the template.
@@ -4223,12 +2894,19 @@ class DASProcessor:
         signal peaks from a smoothed amplitude envelope, and checks candidates by
         cross-correlating them with a whale-call template. It prints detection
         summaries and statistics, then displays and saves a plot for one processed
-        channel as ``Whale_detector.png``. If no MiniSEED stream is loaded, it is
-        created from the requested event.
+        channel as ``Whale_detector.png``.
+
+        The data source is, in order of priority: ``stream`` (an ObsPy
+        ``Stream``, or a single ``Trace``), the processor's already-loaded
+        MiniSEED stream, or a stream built from ``event``. A supplied
+        ``stream`` is analysed as-is and is neither modified nor stored on the
+        processor. Traces may have different sampling rates; each is processed
+        at its own rate.
 
         Args:
-            event: Event key used to create the MiniSEED stream when one is not
-                   already loaded.
+            event: Event key used to create the MiniSEED stream when no
+                   ``stream`` is given and none is loaded. A Stream/Trace
+                   passed here is treated as ``stream``.
             species: Whale species used to select a default template when
                      ``template`` is not provided. Supported values are
                      ``"blue"``, ``"fin"``, ``"humpback"``, ``"sei"``,
@@ -4248,7 +2926,6 @@ class DASProcessor:
             thresh: Candidate amplitude threshold as a multiple of the median
                     envelope amplitude.
             min_dist: Minimum separation between candidate peaks, in seconds.
-            template_path: Path to the default whale-call template file.
             template_fs: Sampling rate, in Hz, of the template.
             search_win_sec: Cross-correlation search window, in seconds.
             corr_thresh: Minimum cross-correlation value for accepting a
@@ -4263,6 +2940,15 @@ class DASProcessor:
             spec_nfft: FFT length used for the spectrogram.
             spec_dr: Spectrogram dynamic range, in dB.
             cmap: Matplotlib colormap name for the spectrogram.
+            stream: ObsPy ``Stream`` (or ``Trace``) to analyse directly.
+                    Must not contain masked (gappy) data.
+            report: Print the detection summary to stdout.
+            plot: Draw the detection figure for one processed channel. The
+                  figure is also kept as ``self.whale_figure``.
+            save_path: File the figure is saved to; ``None`` to skip saving.
+            show: Call ``plt.show()``. The figure is closed afterwards either
+                  way, so batch runs do not accumulate open figures; the
+                  ``self.whale_figure`` object can still be saved or reshown.
 
         Returns:
             A list of dictionaries, ``all_results``, containing one record for
@@ -4287,629 +2973,29 @@ class DASProcessor:
               ``channel_<index>`` label when no station label is available.
 
             ``single`` and ``auto`` modes return detections for one channel;
-            ``all`` mode combines detections from all channels. The method also
-            prints summaries and displays and saves a plot.
+            ``all`` mode combines detections from all channels. Printing, plotting
+            and saving are optional (``report``, ``plot``, ``save_path``,
+            ``show``); with all of them off the method is pure computation.
 
         Raises:
             ValueError: If neither ``species`` nor ``template`` is provided, if
-                the species or detection mode is unsupported, or if single mode
-                is selected without a channel index.
+                the species or detection mode is unsupported, if single mode
+                is selected without a channel index, if no stream, loaded data
+                or event is available, or if the stream is empty or gappy.
+            TypeError: If ``stream`` is not a Stream or Trace.
             FileNotFoundError: If the selected template file does not exist.
             IndexError: If ``channel_idx`` is outside the stream.
         """
-        template = self._setup_whale_detection(event, species, template, template_fs)
-
-        process_indices = self._select_whale_indices(
-            self.mseed_stream, detection_mode, channel_idx, band_detect
-        )
-
-        processed = []
-        for idx in process_indices:
-            processed.append(self._process_whale_trace(
-                self.mseed_stream[idx], idx, template, template_fs, band_detect,
-                env_win, thresh, min_dist, search_win_sec, corr_thresh
-            ))
-
-        plot_result = self._choose_whale_plot_result(processed)
-
-        all_results = []
-        for p in processed:
-            for rec in p["results"]:
-                rec2 = rec.copy()
-                rec2["channel_idx"] = p["idx"]
-                rec2["channel_label"] = p["label"]
-                all_results.append(rec2)
-
-        self._report_whale_detections(
-            detection_mode, processed, all_results, band_detect, env_win
-        )
-        self._plot_whale_detections(
-            plot_result, spec_source, spec_fmin, spec_fmax, spec_nperseg,
-            spec_noverlap, spec_nfft, spec_dr, cmap
-        )
-
-        return all_results
-
-def get_travel_times(event,global_params,rec_lat,rec_lon):
-    """
-    Compute theoretical P and S arrival times for an event at a receiver location.
-
-    Parameters:
-    - event: key identifying the source event in the `sources` dictionary.
-    - global_params: dict containing at least 'exec_params' and 'sources'.
-    - rec_lat, rec_lon: receiver latitude and longitude in degrees.
-
-    Returns:
-    - arrivals_p, arrivals_s: lists of TauP arrival objects for P and S phases.
-    """
-    ep = global_params['exec_params']
-    sources = global_params['sources']
-    
-    #calculate theoretical arrival time
-    source_latitude = sources.get(event, {}).get("latitude")
-    source_longitude = sources.get(event, {}).get("longitude")
-    source_depth = sources.get(event, {}).get("depth")
-    i91 = TauPyModel(model="iasp91")
-    arrivals_p = i91.get_travel_times_geo(source_depth_in_km=source_depth, receiver_latitude_in_deg=rec_lat,\
-                                              receiver_longitude_in_deg=rec_lon, source_latitude_in_deg=source_latitude,\
-                                              source_longitude_in_deg=source_longitude,phase_list=('ttp',), ray_param_tol=0.1)
-    arrivals_s = i91.get_travel_times_geo(source_depth_in_km=source_depth, receiver_latitude_in_deg=rec_lat,\
-                                              receiver_longitude_in_deg=rec_lon, source_latitude_in_deg=source_latitude,\
-                                              source_longitude_in_deg=source_longitude,phase_list=('tts',), ray_param_tol=0.1)
-    for arr in arrivals_p:
-        arr.time=round(arr.time, 3)
-
-    for arr in arrivals_s:
-        arr.time=round(arr.time, 3)
-        
-    if ep.get("verbose"):
-        print(arrivals_p,arrivals_s)
-
-    return arrivals_p, arrivals_s
-
-@functools.lru_cache(maxsize=8)
-def _load_coords_table(csv_path, mtime_ns):
-    """
-    Read the coordinates CSV once and index it by channel.
-
-    Cached on (path, modification time), so editing the file is picked up
-    automatically. Returns {"CHANNEL": {channel: row_dict}, "ROI_CHANNEL": {...}};
-    only keys whose column exists in the CSV are present. When a channel
-    appears more than once the first row wins, as with the old
-    df.loc[...].values[0].
-    """
-    df = pd.read_csv(csv_path)
-    tables = {}
-    for key in ("CHANNEL", "ROI_CHANNEL"):
-        if key in df.columns:
-            tables[key] = (df.drop_duplicates(subset=key, keep="first")
-                             .set_index(key).to_dict("index"))
-    return tables
-
-
-def clear_coords_cache():
-    """Force the next lookup to re-read the coordinates CSV."""
-    _load_coords_table.cache_clear()
-
-
-def _coords_row(channel, global_params, roi_channel=False):
-    """Row dict for `channel` from the cached coordinates table, or None."""
-    pp = global_params['path_params']
-    csv_path = os.path.join(pp['coords_path'], pp['coords_DAS'])
-    tables = _load_coords_table(csv_path, os.stat(csv_path).st_mtime_ns)
-    key = 'ROI_CHANNEL' if roi_channel else 'CHANNEL'
-    if key not in tables:
-        raise KeyError(key)
-    return tables[key].get(channel)
-
-
-def get_coordinates(channel, global_params, roi_channel=False, strict=False):
-    """
-    Get coordinates (latitude, longitude, elevation) based on the provided channel.
-    The CSV is read once and cached (see _load_coords_table).
-
-    Parameters:
-    - channel (int): The channel number for which coordinates are needed.
-    - global_params: dictionary with 'exec_params' and 'path_params'
-      (coords_path, coords_DAS locate the CSV file).
-    - roi_channel (bool): look the channel up in ROI_CHANNEL instead of CHANNEL.
-    - strict (bool): raise KeyError for an unknown channel instead of returning
-      the hardcoded default position (32.64441, -16.94396, 20).
-
-    Returns:
-    Tuple (float, float, float): latitude, longitude, elevation.
-    """
-    ep, pp = global_params['exec_params'], global_params['path_params']
-
-    if ep.get("verbose", False) == 2:
-        print(f"Getting coordinates for channel {channel} from {pp['coords_path']}{pp['coords_DAS']}")
-
-    row = _coords_row(channel, global_params, roi_channel)
-
-    if row is None:
-        if strict:
-            raise KeyError(f"Channel {channel} not found in {pp['coords_DAS']}")
-        # Default position for unknown channels (kept for backward compatibility)
-        return 32.64441, -16.94396, 20
-
-    return row['LATITUDE'], row['LONGITUDE'], round(row['ALTITUDE'], 0)
-
-def get_azimuth_dip(channel, global_params, roi_channel=False):
-    """
-    Get azimuth and dip based on the provided channel.
-    The CSV is read once and cached (see _load_coords_table).
-
-    Parameters:
-    - channel (int): The channel number.
-    - global_params: dictionary with 'exec_params' and 'path_params'.
-    - roi_channel (bool): look the channel up in ROI_CHANNEL instead of CHANNEL.
-
-    Returns:
-    Tuple (float, float): azimuth (0-360) and dip. (0, 0) for an unknown channel.
-    """
-    ep, pp = global_params['exec_params'], global_params['path_params']
-
-    if ep.get("verbose", False) == 2:
-        print(f"Getting azimuth and dip for channel {channel} from {pp['coords_path']}{pp['coords_DAS']}")
-
-    row = _coords_row(channel, global_params, roi_channel)
-
-    if row is None:
-        azi, dip = 0, 0
-    else:
-        azi, dip = row['AZIMUTH'], row['DIP']
-
-    if azi < 0:
-        azi += 360
-
-    return azi, dip
-
-def encode_station_name(prefix,distance,global_params):
-    """
-    Encode a station name using a prefix and a numeric distance.
-
-    Parameters:
-    - prefix: string prefix for the station code.
-    - distance: numeric distance (metres) used to generate the code suffix.
-    - global_params: dictionary containing 'exec_params' for verbosity control.
-
-    Returns:
-    - code: formatted station code string.
-    """
-    ep=global_params.get("exec_params")   
-
-    distance_m=int(distance)
-    code_length = 5 - len(prefix)  # Calculate dynamic length
-    factor=10 ** (5-code_length)
-    converted_distance = distance_m // factor
-    code = f"{prefix}{converted_distance:0{code_length}d}"
-
-    if ep.get("verbose"):
-        print(f'Encoded station: name: {code} - distance={distance} code_length={code_length} division_factor={factor}')
-    return code
-
-def station_xml_creation(st, global_params):
-    """
-    Create a StationXML file from an ObsPy Stream `st` using configuration in `global_params`.
-
-    Parameters:
-    - st: ObsPy Stream containing station traces with coordinates and metadata.
-    - global_params: dictionary with acquisition, path, exec, freq, trace header and stationxml params.
-
-    The decimation stages are built from sp["decimation_steps"], i.e. from what
-    was actually applied to the data, not from freq_params["decimation_factor"].
-
-    Side effects:
-    - Writes StationXML to `pp.get("MSEED_path")`.
-
-    Raises:
-    - KeyError if a trace has no latitude/longitude/elevation.
-    - ValueError if the recorded decimation history does not reproduce the
-      stream's sampling rate, or if int32_resolution is not a known label.
-    """
-    ap, pp, ep = global_params['acquisition_params'], global_params['path_params'], global_params['exec_params']
-    th, sp = global_params['trace_header'], global_params['stationxml_params']
-
-    for tr in st:
-        for coord in ["latitude", "longitude", "elevation"]:
-            if coord not in tr.stats.coordinates:
-                print(f'Station {tr.stats.station} has no {coord} field!\nStationXML file not created.')
-                raise KeyError(f"Missing '{coord}' in tr.stats.coordinates")
-
-    # --- Decimation history -------------------------------------------------
-    steps = sp.get("decimation_steps", [])
-    total_decimation = math.prod(s["factor"] for s in steps)   # 1 if no steps
-
-    # The recorded history must explain the data's sampling rate. If steps were
-    # applied before this data was loaded (or state drifted), the response
-    # would be wrong, so stop here instead of writing it.
-    expected_rate = ap["original_sample_rate"] / total_decimation
-    actual_rate = st[0].stats.sampling_rate
-    if not np.isclose(expected_rate, actual_rate, rtol=1e-6):
-        raise ValueError(
-            f"Decimation history is inconsistent with the data: "
-            f"original_sample_rate / total decimation = {expected_rate} Hz, "
-            f"but the stream is at {actual_rate} Hz. Steps applied before this "
-            f"data was loaded are not recorded, so the StationXML response "
-            f"would be wrong.")
-
-    # --- Response stages ----------------------------------------------------
-    response_stages = [
-        PolesZerosResponseStage(
-            stage_sequence_number=1,
-            name="Gain",
-            stage_gain=1,
-            stage_gain_frequency=1.0,
-            input_units="counts",
-            output_units="counts",
-            input_units_description=ap["sensitivityUnits"],
-            output_units_description=ap["sensitivityUnits"],
-            normalization_factor=1,
-            normalization_frequency=0,
-            pz_transfer_function_type="LAPLACE (RADIANS/SECOND)",
-            zeros=[],
-            poles=[],
-        )
-    ]
-
-    for i, step in enumerate(steps):
-        fir = step.get("fir")
-        if fir is not None:
-            # Linear-phase FIR applied by resample_poly (decimate_dfdas).
-            # The filter delay, (ntaps-1)/2 samples, is removed by resample_poly
-            # (output is centred), so delay == correction.
-            fir = np.asarray(fir, dtype=float)
-            delay = ((len(fir) - 1) / 2) / step["input_sampling_rate"]
-            stage_name = (f"Linear-phase FIR (Kaiser) low-pass + Decimation step {i + 1}. "
-                          f"Decimation factor: {step['factor']}")
-            numerator, denominator = fir.tolist(), []
-        else:
-            # Zero-phase Chebyshev II applied by decimate_st (filtfilt)
-            delay = 0
-            stage_name = (f"Low-pass Chebyshev filter stage + Decimation step {i + 1}. "
-                          f"Decimation factor: {step['factor']}")
-            numerator = np.asarray(step["b"]).tolist()
-            denominator = np.asarray(step["a"]).tolist()
-
-        response_stages.append(CoefficientsTypeResponseStage(
-            stage_sequence_number=i + 2,
-            name=stage_name,
-            cf_transfer_function_type="DIGITAL",
-            stage_gain_frequency=1.0,
-            stage_gain=1,
-            input_units="counts",
-            output_units="counts",
-            input_units_description=ap["sensitivityUnits"],
-            output_units_description=ap["sensitivityUnits"],
-            decimation_factor=step["factor"],
-            decimation_input_sample_rate=step["input_sampling_rate"],
-            decimation_offset=0,
-            decimation_delay=delay,
-            decimation_correction=delay,
-            denominator=denominator,
-            numerator=numerator,
-        ))
-
-    last_stage = len(response_stages) + 1
-    output_rate = ap["original_sample_rate"] / total_decimation
-
-    response_stages.append(CoefficientsTypeResponseStage(
-        stage_sequence_number=last_stage,
-        name="Sensitivity",
-        cf_transfer_function_type="DIGITAL",
-        numerator=[],
-        denominator=[],
-        decimation_factor=1,
-        decimation_correction=0,
-        decimation_delay=0,
-        decimation_offset=0,
-        decimation_input_sample_rate=output_rate,
-        stage_gain=ap["sensitivity"],
-        stage_gain_frequency=1.0,
-        input_units="counts",
-        output_units="counts",
-        input_units_description=ap["sensitivityUnits"],
-        output_units_description=ap["sensitivityUnits"],
-    ))
-
-    # Counts -> physical units stage, only for int32 output. stage_gain comes
-    # from the same table dfdas_to_mseed multiplies by, so they cannot differ.
-    resolution = sp.get("int32_resolution")
-    if ep.get("verbose"):
-        print(f"int32_resolution: {resolution}")
-    if resolution is not None:
-        if resolution not in INT32_SCALES or resolution not in _INT32_STAGE_TEXT:
-            raise ValueError(
-                f"Unknown int32_resolution {resolution!r}; "
-                f"expected one of {list(INT32_SCALES)}.")
-        stage_name, out_units, out_desc = _INT32_STAGE_TEXT[resolution]
-        response_stages.append(CoefficientsTypeResponseStage(
-            stage_sequence_number=last_stage + 1,
-            name=stage_name,
-            cf_transfer_function_type="DIGITAL",
-            stage_gain=INT32_SCALES[resolution],
-            stage_gain_frequency=1.0,
-            input_units="counts",
-            output_units=out_units,
-            input_units_description="Digital counts mapped to int32",
-            output_units_description=out_desc,
-            numerator=[],
-            denominator=[],
-            decimation_factor=1,
-            decimation_offset=0,
-            decimation_delay=0,
-            decimation_correction=0,
-            decimation_input_sample_rate=output_rate,
-        ))
-
-    response = Response(
-        resource_id="OptoDAS header",
-        instrument_sensitivity=InstrumentSensitivity(
-            value=ap["sensitivity"],
-            frequency=1.0,
-            input_units="counts",
-            output_units="counts",
-            output_units_description="strain per meter",
-            input_units_description=ap["sensitivityUnits"] + " phase difference expressed in radians per strain per meter",
-            frequency_range_start=0.001,
-            frequency_range_end=2000.0,
-            frequency_range_db_variation=0,
-        ),
-        response_stages=response_stages)
-
-    # --- Equipment / operator / network ------------------------------------
-    install_date = UTCDateTime(*th.get("net_starttime"))
-
-    def _das_equipment():
-        return Equipment(
-            type="DAS",
-            description="OptoDAS",
-            manufacturer="ASN",
-            serial_number="44",
-            installation_date=install_date,
-            resource_id="OptoDAS_44",
-        )
-
-    sensor, data_logger, pre_amplifier = _das_equipment(), _das_equipment(), _das_equipment()
-
-    operator = [
-        Operator(
-            agency="ARDITI",
-            contacts=[
-                Person(
-                    names=["Afonso Loureiro"],
-                    agencies=["ARDITI, Funchal, Portugal",
-                              "Instituto Dom Luiz, Lisboa, Portugal"],
-                    emails=["maloureiro@fc.ul.pt"])],
-            website="www.arditi.pt",
-        )
-    ]
-
-    inv = Inventory(networks=[], source=th.get("inventory_source"))
-
-    net = Network(
-        code=st[0].stats.network,
-        stations=[],
-        description=th.get("net_description"),
-        start_date=UTCDateTime(ap.get("start_date")),
-        end_date=UTCDateTime(ap.get("end_date")),
-        total_number_of_stations=th.get("net_no_stations"),
-        selected_number_of_stations=len(st),
-    )
-
-    for tr in st:
-        station_code = tr.stats.station
-        if ep.get("encode_station_name"):
-            das_channel = tr.stats['decoded_station']
-        else:
-            das_channel = tr.stats.station
-
-        sta = Station(
-            code=station_code,
-            latitude=tr.stats.coordinates["latitude"],
-            longitude=tr.stats.coordinates["longitude"],
-            elevation=tr.stats.coordinates["elevation"],
-            creation_date=install_date,
-            start_date=UTCDateTime(ap.get("start_date")),
-            end_date=UTCDateTime(ap.get("end_date")),
-            site=Site(name=f'{th.get("sta_name_prefix")} {tr.stats.channel} channel no.{str(das_channel).zfill(5)}'),
-            total_number_of_channels=1,
-        )
-        sta.operators = operator
-
-        azimuth, dip = get_azimuth_dip(int(tr.stats.distance / ap.get("dx") + 1), global_params, roi_channel=False)
-        cha = Channel(
-            code="HSF",
-            location_code=th.get("location"),
-            latitude=tr.stats.coordinates["latitude"],
-            longitude=tr.stats.coordinates["longitude"],
-            elevation=tr.stats.coordinates["elevation"],
-            start_date=UTCDateTime(ap.get("start_date")),
-            end_date=UTCDateTime(ap.get("end_date")),
-            sample_rate=tr.stats.sampling_rate,
-            depth=0,
-            azimuth=azimuth,
-            dip=dip,
-        )
-        cha.response = response
-        cha.equipments = [sensor, data_logger, pre_amplifier]
-        cha.sensor = sensor
-        cha.data_logger = data_logger
-        cha.pre_amplifier = pre_amplifier
-        sta.channels.append(cha)
-        net.stations.append(sta)
-
-    inv.networks.append(net)
-
-    file = os.path.join(pp.get("MSEED_path"), f'RESP.{th.get("network")}.HSF.xml')
-    os.makedirs(pp.get("MSEED_path"), exist_ok=True)
-    inv.write(file, format="stationxml", validate=True)
-
-    if ep.get("verbose"):
-        print(f'StationXML file written to: {file}')
-
-    if ep.get("verbose", False) == 2:
-        print(inv)
-        inv[0][-1][0].response.plot(min_freq=0.01, unwrap_phase=True)
-
-    return
-
-def degrade_coordinates(lat, lon, precision=3, error_metres=200):
-    """
-    Degrades precision and adds a random spatial displacement (error).
-    """
-    # 1. Calculate the degree offset for Latitude
-    # 1 degree lat ≈ 111,111 meters
-    lat_offset = error_metres / 111111.0
-    
-    # 2. Calculate the degree offset for Longitude
-    # 1 degree lon ≈ 111,111 * cos(latitude) meters
-    lon_offset = error_metres / (111111.0 * np.cos(np.radians(lat)))
-    
-    # 3. Apply a random shift within the error range
-    # This creates a random displacement in any direction up to the error_meters
-    random_lat_shift = np.random.uniform(-lat_offset, lat_offset)
-    random_lon_shift = np.random.uniform(-lon_offset, lon_offset)
-    
-    # 4. Apply shift and then round for precision
-    degraded_lat = round(lat + random_lat_shift, precision)
-    degraded_lon = round(lon + random_lon_shift, precision)
-    
-    return degraded_lat, degraded_lon
-
-def get_cheby2_coeffs(nyquist, freqmax):
-    """
-    Calculates stable Chebyshev Type II coefficients for the current data.
-    Ensures order <= 12 for numerical stability.
-    """
-    
-    # rp - maximum ripple of passband, rs - attenuation of stopband
-    rp, rs, order = 1, 96, 1e99
-    # stop band frequency
-    ws = freqmax / nyquist
-    # pass band frequency
-    wp = ws
-
-    while True:
-        if order <= 12:
-            break
-        wp *= 0.99
-        order, wn = sps.cheb2ord(wp, ws, rp, rs, analog=0)
-
-    b, a = sps.cheby2(order, rs, wn, btype="low", analog=0, output="ba")
-    return b,a
-
-def zerophase_effective_fir(b, a, tol=1e-6, max_len=200_000):
-    """
-    Effective FIR of signal.filtfilt(b, a, x): the autocorrelation of the IIR
-    impulse response, truncated where it falls below tol * peak.
-    Symmetric, odd length, DC gain ~1.
-    """
-    imp = np.zeros(max_len)
-    imp[0] = 1.0
-    h = sps.lfilter(b, a, imp)
-    big = np.nonzero(np.abs(h) > tol * np.max(np.abs(h)))[0]
-    if big[-1] >= max_len - 1:
-        raise ValueError("IIR impulse response did not decay within max_len samples")
-    h = h[:big[-1] + 1]
-    return sps.fftconvolve(h, h[::-1])
-
-def zerophase_chebyshev_lowpass_filter(trace, freqmax):
-        """
-        Custom Chebychev type two zerophase lowpass filter useful for
-        decimation filtering.
-        This filter is stable up to a reduction in frequency with a factor of
-        10. If more reduction is desired, simply decimate in steps.
-        Partly based on a filter in ObsPy.
-        :param trace: The trace to be filtered.
-        :param freqmax: The desired lowpass frequency.
-        Will be replaced once ObsPy has a proper decimation filter.
-        This code is from LASIF repository (Lion Krischer).
-        """
-        b, a = get_cheby2_coeffs(trace.stats.sampling_rate * 0.5, freqmax)
-
-        # Apply twice to get rid of the phase distortion.
-        trace.data = sps.filtfilt(b, a, trace.data)
-
-def get_data_from_S3(bucket_name, endpoint_url, starttime, endtime, local_path, unsigned=False):
-    """
-    Download DAS raw files from an S3-compatible endpoint for a single day.
-
-    Parameters:
-    - bucket_name: name of the S3 bucket.
-    - endpoint_url: S3 endpoint URL.
-    - starttime, endtime: datetime.datetime objects defining the interval (must be same day).
-    - local_path: local directory where files will be saved (organized by hour).
-    - unsigned: if True, use unsigned (anonymous) S3 access.
-
-    Returns:
-    - True on success, False on failure or invalid input.
-    """
-    # Local Imports
-    import boto3
-    import os
-    from botocore.config import Config
-    from botocore import UNSIGNED
-
-    # 1. Multi-day Guard: Warn and exit if start and end are on different days
-    if starttime.date() != endtime.date():
-        print(f"WARNING: starttime ({starttime.date()}) and endtime ({endtime.date()}) "
-              "are on different days. This function only processes single-day requests.")
-        return False
-
-    # 2. Setup S3 Resource
-    if unsigned:
-        s3_res = boto3.resource('s3', endpoint_url=endpoint_url, config=Config(signature_version=UNSIGNED))
-    else:
-        s3_res = boto3.resource('s3', endpoint_url=endpoint_url)
-
-    bucket = s3_res.Bucket(bucket_name)
-
-    try:
-        prefix = starttime.strftime('%Y%m%d/dphi/%H')
-        dir_structure = starttime.strftime('%Y%m%d/dphi/')
-        h5start = starttime.strftime('%Y%m%d/dphi/%H%M%S.h5')
-        h5end = endtime.strftime('%Y%m%d/dphi/%H%M%S.h5')
-        
-        files_to_download = []
-        last_seen_key = None
-        
-        # Check if we should skip the buffer file (Midnight check)
-        is_midnight = (starttime.hour == 0 and starttime.minute == 0 and starttime.second == 0)
-
-        for obj in bucket.objects.filter(Prefix=prefix):
-            if obj.key > h5end:
-                break
-            
-            if h5start <= obj.key <= h5end:
-                # Add buffer file ONLY if not midnight AND it's the first file found
-                if not files_to_download and last_seen_key and not is_midnight:
-                    files_to_download.append(last_seen_key)
-                
-                files_to_download.append(obj.key)
-            
-            last_seen_key = obj.key
-
-        # 3. Execution
-        if not files_to_download:
-            print("No files found for the specified time range.")
-            return True
-
-        target_dir = os.path.join(local_path, dir_structure)
-        if not os.path.exists(target_dir):
-            os.makedirs(target_dir)
-        for key in files_to_download:
-            target = os.path.join(target_dir, os.path.basename(key))
-            if os.path.exists(target):
-                print(f"File {target} already exists in {target_dir}. Skipping download.")
-                continue
-            print(f"Downloading: {key} to {target}")
-            bucket.download_file(key, target)
-
-        print(f"Successfully downloaded {len(files_to_download)} files.")
-        return True
-
-    except Exception as e:
-        print(f"Error: {e}")
-        return False
-
+        st = self._resolve_whale_stream(event, stream)
+        result = detect_baleen_whales(
+            st, species=species, template=template, template_fs=template_fs,
+            detection_mode=detection_mode, channel_idx=channel_idx,
+            params=DetectionParams(
+                band_detect=band_detect, env_win=env_win, thresh=thresh,
+                min_dist=min_dist, search_win_sec=search_win_sec, corr_thresh=corr_thresh),
+            spectrogram=SpectrogramParams(
+                source=spec_source, fmin=spec_fmin, fmax=spec_fmax, nperseg=spec_nperseg,
+                noverlap=spec_noverlap, nfft=spec_nfft, dr=spec_dr, cmap=cmap),
+            report=report, plot=plot, save_path=save_path, show=show)
+        self.whale_figure = result.figure
+        return result.detections
