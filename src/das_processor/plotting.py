@@ -881,113 +881,190 @@ class PlottingMixin:
         plt.show()
         plt.close(fig)
 
+    # ------------------------------------------------------------------
+    # Record section: the public method, then one helper per step
+    # ------------------------------------------------------------------
+    _RECORD_PHASES = ('p', 'sP', 's', 'P', 'PP', 'S', 'SS', 'SKS')
+
     def plot_record_sections(self, dataset=None, event=None, suffix=""):
-        # Use class attributes for configuration to integrate with DASProcessor
+        """Plot a vertical record section of the DAS cable for ``event``.
+
+        The cable traces are drawn as a section with theoretical phase curves.
+        Depending on ``exec_params`` it adds land-station traces
+        (``plot_land_station``, from MiniSEED or an EIDA download) and/or stacks
+        of cable traces (``plot_stack``) in side panels; ``plot_section_colour``
+        fills the section. Other keys read: ``station``, ``land_station``,
+        ``verbose`` (exec_params), ``figures_path``, ``MSEED_path``,
+        ``mseed_land_stations`` (path_params) and
+        ``land_station_min_freq``/``land_station_max_freq`` (freq_params). The event
+        entry in ``sources`` needs latitude, longitude, depth, magnitude, time,
+        start_time, end_time and window_in.
+
+        Args:
+            dataset: Stream to plot, or a dfdas DataFrame to convert. When None the
+                     processor's loaded stream (or dfdas) is used.
+            event: Key of the event in ``self.sources``.
+            suffix: Appended to the output file name.
+
+        Writes ``<figures_path>/<event>_record-section[_suffix]<STA-CHA...>.eps/.pdf``
+        and runs ``./plot_GMTmap.sh`` for the map. Note that the cable stream is
+        band-pass filtered in place.
+        """
         ep, pp, fp = self.exec_params, self.path_params, self.freq_params
         station_coordinates = self.station_coordinates
 
         event_info = self.sources.get(event, {})
-        station=ep["station"]
-    
+        cable_station = ep["station"]
+
         logger.info("Plotting record section.")
-        result=subprocess.run(["bash","./plot_GMTmap.sh",
-                                      str(event_info.get("longitude")),
-                                      str(event_info.get("latitude")),
-                                      f'"{str(event_info.get("magnitude"))} {event_info.get("depth")}km"',
-                                      f'{str(event)}_map.ps'],
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    
-        filename=f'{pp.get("figures_path")}/{event}_record-section{f"_{suffix}" if suffix else ""}'
-    
-        dist_az_baz=gps2dist_azimuth(event_info['latitude'],event_info['longitude'],
-                                     self.station_coordinates.get(station)["latitude"],
-                                     self.station_coordinates.get(station)["longitude"])
-        if dist_az_baz[0]<100000:
-            local = True
-            logger.info("Distance to event is less than 100 km. Considering it a local event for plotting.")
-        else:
-            local = False
-            logger.info("Distance to event is greater than 100 km. Considering it a regional/teleseismic event.")
+        gmt_result = self._run_gmt_map(event, event_info)
+
+        filename = f'{pp.get("figures_path")}/{event}_record-section{f"_{suffix}" if suffix else ""}'
+
+        local = self._is_local_event(event_info, cable_station)
 
         if ep.get("verbose"):
-            logger.debug("Standard output:\n%s", result.stdout)
-            logger.debug("Standard error:\n%s", result.stderr)
-            if result.returncode == 0:
-                logger.debug("Bash script executed successfully.")
-            else:
-                logger.warning("Bash script returned an error (return code %d).", result.returncode)
-    
+            self._log_gmt_result(gmt_result)
+
         plt.rcParams['figure.dpi'] = 1200
-        fig=plt.figure(clear=True,figsize=(10,6))
-    
-    
-    # get land stations
-        
+
+        # Land station and source geometry
         source_latitude = event_info.get("latitude")
         source_longitude = event_info.get("longitude")
         source_depth = event_info.get("depth")
-        station=ep.get("land_station")
-        station_lat=station_coordinates.get(station,{}).get("latitude")
-        station_lon=station_coordinates.get(station,{}).get("longitude")
-    
+        land_station = ep.get("land_station")
+        station_lat = station_coordinates.get(land_station, {}).get("latitude")
+        station_lon = station_coordinates.get(land_station, {}).get("longitude")
+
         i91 = TauPyModel(model="iasp91")
-    
-        #filtering according to distance
+
+        # Bandpass of the cable data depends on distance
         if local:
-            max_freq=30
-            min_freq=.5
+            max_freq = 30
+            min_freq = .5
         else:
-            max_freq=.1
-            min_freq=0.01
-    
-        fig = plt.figure(figsize=(40, 8))  #12,4 #54,8  #12,4
-    
+            max_freq = .1
+            min_freq = 0.01
+
+        # One figure, sized for the number of side panels
         if ep.get("plot_stack"):
-            fig = plt.figure(figsize=(40, 8))  #12,4 #54,8  #12,4
+            figsize = (40, 8)
             gs = GridSpec(1, 5, width_ratios=[9, .7, .7, .7, .7])
         elif ep.get("plot_land_station"):
-            fig = plt.figure(figsize=(40, 8))  #12,4 #54,8  #12,4
+            figsize = (40, 8)
             gs = GridSpec(1, 4, width_ratios=[9, .7, .7, .7])
         else:
-            fig = plt.figure(figsize=(30, 8))  #12,4 #54,8  #12,4
+            figsize = (30, 8)
             gs = GridSpec(1, 1)
-    
-        arrivals_p = i91.get_travel_times_geo(source_depth_in_km=source_depth, receiver_latitude_in_deg=station_lat,\
-                                                  receiver_longitude_in_deg=station_lon, source_latitude_in_deg=source_latitude,\
-                                                  source_longitude_in_deg=source_longitude,phase_list=('p','sP','s','P','PP','S','SS','SKS'), ray_param_tol=0.1)
-        
-        # calculate trim points    
-        time_delta=event_info["window_in"]+(UTCDateTime(event_info["end_time"])-UTCDateTime(event_info["start_time"]))
-        
-        pdiff_time=UTCDateTime(event_info.get("start_time"))+arrivals_p[0].time
-        start_trim_time=pdiff_time-datetime.timedelta(seconds=event_info.get("window_in"))
-        end_trim_time=start_trim_time+datetime.timedelta(seconds=time_delta)
-    
+        fig = plt.figure(figsize=figsize)
+
+        arrivals_p = i91.get_travel_times_geo(
+            source_depth_in_km=source_depth, receiver_latitude_in_deg=station_lat,
+            receiver_longitude_in_deg=station_lon, source_latitude_in_deg=source_latitude,
+            source_longitude_in_deg=source_longitude,
+            phase_list=self._RECORD_PHASES, ray_param_tol=0.1)
+
+        # Time window: from window_in before the first P to the event duration
+        time_delta = event_info["window_in"] + (
+            UTCDateTime(event_info["end_time"]) - UTCDateTime(event_info["start_time"]))
+        pdiff_time = UTCDateTime(event_info.get("start_time")) + arrivals_p[0].time
+        start_trim_time = pdiff_time - datetime.timedelta(seconds=event_info.get("window_in"))
+        end_trim_time = start_trim_time + datetime.timedelta(seconds=time_delta)
+
         date_format = DateFormatter("%d-%m-%Y %H:%M:%S")
-    
-        # Reference offset relative to event origin time
+
+        self._shift_arrivals_to_window(arrivals_p, event_info)
+
+        # Cable data
+        st = self._record_section_stream(dataset, event)
+        if st is None:
+            logger.warning("No Stream available for plotting.")
+            return
+
+        st.filter("bandpass", freqmin=min_freq, freqmax=max_freq, corners=4, zerophase=True)
+        st_every_other = self._decimate_for_section(st, local)
+
+        # Side panels: land station and/or cable stacks
+        st_event = self._load_land_station(
+            event, land_station, start_trim_time, end_trim_time)
+        ylim = self._condition_land_station(st_event, fp)
+        ylim_stack = self._add_das_stacks(st_event, st_every_other)
+
+        ax1 = None
+        if len(st_event) > 0:
+            ax1, ax2, panel_names = self._draw_trace_panels(
+                fig, gs, st_event, date_format, time_delta, ylim, ylim_stack)
+            filename += panel_names
+            if ylim_stack is not None and (ylim is None or not ep.get("plot_land_station")):
+                ylim = ylim_stack
+            self._label_phases_on_panel(ax2[0], arrivals_p, event, time_delta, local, ylim)
+
+        # Main panel: the cable section with phase curves
+        ax0 = fig.add_subplot(gs[0])
+        offset_traveltime_arrival = self._cable_arrival_curves(
+            i91, st_every_other, event_info, source_depth, source_latitude, source_longitude)
+        self._draw_cable_section(
+            fig, ax0, ax1[0] if ax1 is not None else None, st_every_other, event,
+            offset_traveltime_arrival, time_delta, local)
+
+        self._save_record_section(filename)
+
+        logger.debug(f'Interspace spacing={st_every_other[1].stats.distance-st_every_other[0].stats.distance} from {st_every_other[0].stats.distance} to {st_every_other[-1].stats.distance}. {len(st_every_other)} traces.')
+        logger.info("Finished plotting record section.")
+
+    @staticmethod
+    def _run_gmt_map(event, event_info):
+        """Run the GMT map script for the event and return the CompletedProcess."""
+        return subprocess.run(["bash", "./plot_GMTmap.sh",
+                               str(event_info.get("longitude")),
+                               str(event_info.get("latitude")),
+                               f'"{str(event_info.get("magnitude"))} {event_info.get("depth")}km"',
+                               f'{str(event)}_map.ps'],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    @staticmethod
+    def _log_gmt_result(result):
+        logger.debug("Standard output:\n%s", result.stdout)
+        logger.debug("Standard error:\n%s", result.stderr)
+        if result.returncode == 0:
+            logger.debug("Bash script executed successfully.")
+        else:
+            logger.warning("Bash script returned an error (return code %d).", result.returncode)
+
+    def _is_local_event(self, event_info, cable_station):
+        """True when the event is closer than 100 km to the cable station."""
+        dist_az_baz = gps2dist_azimuth(event_info['latitude'], event_info['longitude'],
+                                       self.station_coordinates.get(cable_station)["latitude"],
+                                       self.station_coordinates.get(cable_station)["longitude"])
+        if dist_az_baz[0] < 100000:
+            logger.info("Distance to event is less than 100 km. Considering it a local event for plotting.")
+            return True
+        logger.info("Distance to event is greater than 100 km. Considering it a regional/teleseismic event.")
+        return False
+
+    @staticmethod
+    def _shift_arrivals_to_window(arrivals_p, event_info):
+        """Re-reference the arrival times (in place) to the start of the plotted window."""
         p_time = arrivals_p[0].time - event_info.get('window_in')
         event_time = UTCDateTime(event_info.get('start_time'))
-    
+
         for arr in arrivals_p:
             # Keep time as float offset (seconds)
             arr.time = round(arr.time, 3)
-            # Print absolute arrival time
             logger.debug("%s %s", arr.name, event_time + arr.time)
             # Normalise relative arrival time
             arr.time -= p_time
-            # Print updated absolute arrival time
             logger.debug("%s %s", arr.name, event_time + arr.time)
-    
-        # get DAS data
 
-        # If no dataset passed, try to use the class-loaded self.dfdas via the class method.
-        # If a non-Stream `dataset` (e.g., pandas DataFrame) is provided, temporarily set
-        # `self.dfdas` so we can reuse `self.dfdas_to_mseed` and avoid importing the
-        # standalone helper function here.
+    def _record_section_stream(self, dataset, event):
+        """The cable Stream to plot, or None if there is none.
+
+        Uses ``dataset`` if it is a Stream; converts it with ``dfdas_to_mseed`` if
+        it is a dfdas DataFrame (temporarily set as ``self.dfdas``); with no
+        dataset, uses the loaded ``mseed_stream`` or converts ``self.dfdas``.
+        """
         restore_dfdas = False
         if dataset is None:
-            # Prefer using already-loaded data inside the class
             st = None
             if hasattr(self, 'mseed_stream') and self.mseed_stream is not None:
                 st = self.mseed_stream
@@ -996,7 +1073,6 @@ class PlottingMixin:
         elif isinstance(dataset, Stream):
             st = dataset
         else:
-            # dataset is likely a pandas DataFrame (dfdas). Temporarily assign and convert.
             orig_dfdas = getattr(self, 'dfdas', None)
             self.dfdas = dataset
             restore_dfdas = True
@@ -1004,217 +1080,233 @@ class PlottingMixin:
 
         if restore_dfdas:
             self.dfdas = orig_dfdas
+        return st
 
-        # If conversion didn't produce a Stream, bail out
-        if st is None:
-            logger.warning("No Stream available for plotting.")
-            return
-
-        st.filter("bandpass", freqmin=min_freq, freqmax=max_freq, corners=4, zerophase=True)
-        
-        # decimate DAS for plotting
-        # Loop through each trace in the Stream
-        # Create a new Stream object containing only every other trace
-        every_other_trace = []
-    
-        if local:
-            decim=400 #2000 #4000 #2000
-        else:
-            decim=100
-        if len(st)> decim:
+    @staticmethod
+    def _decimate_for_section(st, local):
+        """Keep about 400 (local) or 100 evenly spaced traces so the section stays legible."""
+        decim = 400 if local else 100
+        if len(st) > decim:
+            every_other_trace = []
             for i, trace in enumerate(st):
-            # Check if the index is even (i.e., every other trace)
-                if i % int(len(st)/decim) == 0:
+                if i % int(len(st) / decim) == 0:
                     every_other_trace.append(trace)
-            st_every_other = Stream(traces=every_other_trace)
-        else:
-            st_every_other = st.copy()            
-    
-        st_event=Stream()
+            return Stream(traces=every_other_trace)
+        return st.copy()
+
+    def _load_land_station(self, event, land_station, start_trim_time, end_trim_time):
+        """Land-station traces for the window: from MiniSEED, else from EIDA.
+
+        Returns an empty Stream when nothing is found.
+        """
+        ep, pp = self.exec_params, self.path_params
+        station_coordinates = self.station_coordinates
+        channels = station_coordinates.get(land_station, {}).get("channels")
+
+        st_event = Stream()
         if ep.get("plot_land_station"):
-            logger.info(f'Getting channels {station_coordinates.get(station,{}).get("channels")} from {ep.get("land_station")}')
-            if "MSEED_file" in self.sources.get(event,{}):
-                st_land=read(os.path.join(pp.get("MSEED_path", ""),self.sources.get(event, {}).get("MSEED_file", "")))
+            logger.info(f'Getting channels {channels} from {ep.get("land_station")}')
+            if "MSEED_file" in self.sources.get(event, {}):
+                st_land = read(os.path.join(pp.get("MSEED_path", ""), self.sources.get(event, {}).get("MSEED_file", "")))
             else:
-                st_land=read(pp.get("mseed_land_stations"))
-            st_event=st_land.select(channel=station_coordinates.get(station,{}).get("channels"),station=ep.get("land_station"))
+                st_land = read(pp.get("mseed_land_stations"))
+            st_event = st_land.select(channel=channels, station=ep.get("land_station"))
             st_event.trim(starttime=start_trim_time, endtime=end_trim_time)
-        
-        if len(st_event)>0:
-            if start_trim_time<st_event[0].stats.starttime-0.01:
+
+        if len(st_event) > 0:
+            if start_trim_time < st_event[0].stats.starttime - 0.01:
                 logger.warning(f'{st_event[0].stats.station}.{st_event[0].stats.channel} has not enough data before the event.')
                 logger.info(f'{st_event[0].stats.starttime}>{start_trim_time} diff={start_trim_time-st_event[0].stats.starttime}')
-                # window_correction=start_trim_time-st_event[0].stats.starttime
-                # sources.get(event, {})["window_in"] = sources.get(event, {}).get("window_in")+window_correction
-                # re_trim=True
-            if end_trim_time<st_event[0].stats.endtime-0.01:
+            if end_trim_time < st_event[0].stats.endtime - 0.01:
                 logger.warning(f'{st_event[0].stats.station}.{st_event[0].stats.channel} has not enough data after the event.')
                 logger.info(f'{st_event[0].stats.endtime}>{end_trim_time} diff={end_trim_time-st_event[0].stats.endtime}')
-                # window_correction=end_trim_time-st_event[0].stats.endtime
-                # sources.get(event, {})["window_out"] = sources.get(event, {}).get("window_out")+window_correction
-            # re_trim=True
         else:
-            logger.warning(f'The selected channel ({station_coordinates.get(station,{}).get("channels")}) doesn\'t exist in {os.path.join(pp.get("MSEED_path", ""),self.sources.get(event, {}).get("MSEED_file", ""))}.')
+            logger.warning(f'The selected channel ({channels}) doesn\'t exist in {os.path.join(pp.get("MSEED_path", ""), self.sources.get(event, {}).get("MSEED_file", ""))}.')
             # Try to download land station data from a configured EIDA node if available
             try:
                 logger.info("Attempting to download land station data from configured EIDA node...")
-                st_dl = self.download_waveform_data(station_code=station, starttime=start_trim_time, endtime=end_trim_time)
+                st_dl = self.download_waveform_data(station_code=land_station, starttime=start_trim_time, endtime=end_trim_time)
                 if st_dl is not None and len(st_dl) > 0:
                     # Select requested channels and trim to window
                     try:
-                        st_event = st_dl.select(channel=station_coordinates.get(station, {}).get("channels"), station=station)
+                        st_event = st_dl.select(channel=channels, station=land_station)
                         st_event.trim(starttime=start_trim_time, endtime=end_trim_time)
-                        logger.info(f"Successfully downloaded and trimmed data for station {station}.")
+                        logger.info(f"Successfully downloaded and trimmed data for station {land_station}.")
                     except Exception as e:
                         logger.warning(f"Downloaded data present but required channels not found: {e}")
                 else:
                     logger.warning("No data returned from EIDA for the requested interval/station.")
             except Exception as e:
                 logger.error(f"EIDA download attempt failed: {e}")
-    
-        if len(st_event)>0:
-            unique_phases=[]
-            st_event.detrend()
-            st_event.taper(max_percentage=0.05, type='hann')
-            st_event.filter("bandpass", freqmin=fp.get("land_station_min_freq"), freqmax=fp.get("land_station_max_freq"), corners=8, zerophase=True)
-            logger.info(f'Land stations bandpass filtered between {fp.get("land_station_min_freq")} and {fp.get("land_station_max_freq")} Hz')
-            ylim=(round(max(abs(st_event[0].data))/5)+1)*5
-    
-            if len(st_event)>3:
-                st_z = st_event.select(channel='*Z')[:1]
-                st_n = st_event.select(channel='*N')[:1]
-                st_e = st_event.select(channel='*E')[:1]
-                st_event.clear()
-    
-                # Append the selected traces back into st_event
-                st_event += st_z
-                st_event += st_n
-                st_event += st_e
-    
-        if ep.get("plot_stack"):
-            trace_ranges={(0,10),(20,30),(50,60),(- 10,None)}
-            for start,end in trace_ranges:
-                last_traces=st_every_other[start:end]
-                st_stack=Stream()
-                st_stack.extend(last_traces)
-                st_event +=st_stack.stack()
-                st_event[-1].stats.station="DAS"
-                st_event[-1].stats.location=f'{last_traces[0].stats.distance}-{last_traces[-1].stats.distance}'
-            ylim_stack=1.2e-8
-    
-        if len(st_event)>0:
-            ax1 = [None] * len(st_event)
-            ax2 = [None] * len(st_event)
-            for idx,event_channel in enumerate(st_event): #st_event
-                ax1[idx] = fig.add_subplot(gs[idx+1])
+        return st_event
+
+    @staticmethod
+    def _condition_land_station(st_event, fp):
+        """Detrend, taper and bandpass the land traces (in place).
+
+        Keeps one Z, N and E trace when there are more than three. Returns the
+        amplitude limit for the panels, or None when there are no traces.
+        """
+        if len(st_event) == 0:
+            return None
+        st_event.detrend()
+        st_event.taper(max_percentage=0.05, type='hann')
+        st_event.filter("bandpass", freqmin=fp.get("land_station_min_freq"), freqmax=fp.get("land_station_max_freq"), corners=8, zerophase=True)
+        logger.info(f'Land stations bandpass filtered between {fp.get("land_station_min_freq")} and {fp.get("land_station_max_freq")} Hz')
+        ylim = (round(max(abs(st_event[0].data)) / 5) + 1) * 5
+
+        if len(st_event) > 3:
+            st_z = st_event.select(channel='*Z')[:1]
+            st_n = st_event.select(channel='*N')[:1]
+            st_e = st_event.select(channel='*E')[:1]
+            st_event.clear()
+
+            # Append the selected traces back into st_event
+            st_event += st_z
+            st_event += st_n
+            st_event += st_e
+        return ylim
+
+    def _add_das_stacks(self, st_event, st_every_other):
+        """With ``plot_stack``, append four stacks of cable traces to ``st_event``.
+
+        Returns the amplitude limit for the stack panels, or None without stacking.
+        """
+        if not self.exec_params.get("plot_stack"):
+            return None
+        trace_ranges = {(0, 10), (20, 30), (50, 60), (- 10, None)}
+        for start, end in trace_ranges:
+            last_traces = st_every_other[start:end]
+            st_stack = Stream()
+            st_stack.extend(last_traces)
+            st_event += st_stack.stack()
+            st_event[-1].stats.station = "DAS"
+            st_event[-1].stats.location = f'{last_traces[0].stats.distance}-{last_traces[-1].stats.distance}'
+        return 1.2e-8
+
+    @staticmethod
+    def _draw_trace_panels(fig, gs, st_event, date_format, time_delta, ylim, ylim_stack):
+        """One side panel per trace of ``st_event``. Returns (ax1, ax2, names), where
+        ``names`` is the "STATION-CHANNEL" text of each panel, joined, for the file name."""
+        names = ""
+        ax1 = [None] * len(st_event)
+        ax2 = [None] * len(st_event)
+        for idx, event_channel in enumerate(st_event):
+            ax1[idx] = fig.add_subplot(gs[idx + 1])
+            ax1[idx].set_title(f'{event_channel.stats.station}-{event_channel.stats.channel}')
+            names += f'{st_event[idx].stats.station}-{st_event[idx].stats.channel}'
+
+            ax2[idx] = ax1[idx].twinx()
+            ax2[idx].yaxis.set_major_formatter(date_format)
+            ax2[idx].plot(event_channel.data, event_channel.times("matplotlib"), color="black", linewidth=0.05)
+            ax1[idx].plot([0, 0], [0, time_delta], color="white")
+            ax2[idx].invert_yaxis()
+            ax1[idx].margins(0, 0)
+            ax2[idx].margins(0, 0)
+            ax1[idx].invert_yaxis()
+            logger.info(f'Adding {event_channel.stats.station}-{event_channel.stats.channel}')
+            if event_channel.stats.station == "DAS":
+                ax1[idx].set_xlim(-ylim_stack, ylim_stack)
+                ax1[idx].set_title(f'{event_channel.stats.station}-{event_channel.stats.location}')
+            else:
+                ax1[idx].set_xlim(-ylim, ylim)
                 ax1[idx].set_title(f'{event_channel.stats.station}-{event_channel.stats.channel}')
-                filename+=f'{st_event[idx].stats.station}-{st_event[idx].stats.channel}'
-                
-                ax2[idx] = ax1[idx].twinx()
-                ax2[idx].yaxis.set_major_formatter(date_format)
-                ax2[idx].plot(event_channel.data, event_channel.times("matplotlib"), color="black", linewidth=0.05)
-                ax1[idx].plot([0, 0], [0, time_delta], color="white")
-                ax2[idx].invert_yaxis()
-                ax1[idx].margins(0, 0)
-                ax2[idx].margins(0, 0)
-                ax1[idx].invert_yaxis()
-                logger.info(f'Adding {event_channel.stats.station}-{event_channel.stats.channel}')
-                if event_channel.stats.station=="DAS":
-                    ax1[idx].set_xlim(-ylim_stack, ylim_stack)
-                    ax1[idx].set_title(f'{event_channel.stats.station}-{event_channel.stats.location}')
-                else:
-                    ax1[idx].set_xlim(-ylim, ylim)
-                    ax1[idx].set_title(f'{event_channel.stats.station}-{event_channel.stats.channel}')
-                ax1[idx].set_ylim(time_delta,0)
-            
-            label_space = 1 if local else 10
-            prev=0
-            unique_phases=[]
-            if not ep.get("plot_land_station"):
-                ylim=ylim_stack
-            for arr in arrivals_p:
-                if arr.name not in unique_phases:
-                    unique_phases.append(arr.name)
-                    if arr.time > prev+label_space and arr.time < time_delta:
-                        prev=arr.time
-                        plot_time=mdates.date2num(UTCDateTime(self.sources.get(event, {}).get("time"))+arr.time)
-                        logger.debug("%s %s %s %s %s", "UNIQUE ARRIVAL", arr.name, arr.time, plot_time, UTCDateTime(self.sources.get(event, {}).get("time"))+arr.time)
-                        ax2[0].axhline(y=plot_time, color='red')
-                        ax2[0].annotate(arr.name, xy=(ylim*0.9, plot_time), xytext=(-100, 0),
-                                    textcoords='offset pixels')
-            logger.debug("%s %s", "Unique arrivals", unique_phases)
-            
-        ax0 = fig.add_subplot(gs[0])
-    
-        # calculate arrival times for every trace of the cable
+            ax1[idx].set_ylim(time_delta, 0)
+        return ax1, ax2, names
+
+    def _label_phases_on_panel(self, ax, arrivals_p, event, time_delta, local, ylim):
+        """Mark the first arrival of each phase on the first side panel."""
+        label_space = 1 if local else 10
+        prev = 0
+        unique_phases = []
+        for arr in arrivals_p:
+            if arr.name not in unique_phases:
+                unique_phases.append(arr.name)
+                if arr.time > prev + label_space and arr.time < time_delta:
+                    prev = arr.time
+                    plot_time = mdates.date2num(UTCDateTime(self.sources.get(event, {}).get("time")) + arr.time)
+                    logger.debug("%s %s %s %s %s", "UNIQUE ARRIVAL", arr.name, arr.time, plot_time, UTCDateTime(self.sources.get(event, {}).get("time")) + arr.time)
+                    ax.axhline(y=plot_time, color='red')
+                    ax.annotate(arr.name, xy=(ylim * 0.9, plot_time), xytext=(-100, 0),
+                                textcoords='offset pixels')
+        logger.debug("%s %s", "Unique arrivals", unique_phases)
+
+    def _cable_arrival_curves(self, i91, st_every_other, event_info,
+                              source_depth, source_latitude, source_longitude):
+        """Theoretical arrival time per phase along the cable.
+
+        Returns {phase: [[distance_km, time_s], ...]} for the plotted traces.
+        """
         offset_traveltime_arrival = {}
         for tr in st_every_other:
-            part_arrival=[]
-            station_lat=tr.stats.coordinates.latitude
-            station_lon=tr.stats.coordinates.longitude
-            arrivals = i91.get_travel_times_geo(source_depth_in_km=source_depth,
-                                                receiver_latitude_in_deg=station_lat,
-                                                receiver_longitude_in_deg=station_lon,
-                                                source_latitude_in_deg=source_latitude,
-                                                source_longitude_in_deg=source_longitude,
-                                                phase_list=('p','sP','s','P','PP','S','SS','SKS'),
-                                                ray_param_tol=0.1)
+            station_lat = tr.stats.coordinates.latitude
+            station_lon = tr.stats.coordinates.longitude
+            arrivals = i91.get_travel_times_geo(
+                source_depth_in_km=source_depth,
+                receiver_latitude_in_deg=station_lat,
+                receiver_longitude_in_deg=station_lon,
+                source_latitude_in_deg=source_latitude,
+                source_longitude_in_deg=source_longitude,
+                phase_list=self._RECORD_PHASES,
+                ray_param_tol=0.1)
 
             logger.debug("%s %s %s", event_info["start_time"], arrivals[0], self.clock_offset)
-            pdiff_time=UTCDateTime(event_info.get("start_time"))+arrivals[0].time+datetime.timedelta(seconds=self.clock_offset)
-            start_trim_time=pdiff_time-datetime.timedelta(seconds=event_info.get("window_in"))
-        
-            p_time=arrivals[0].time-event_info.get("window_in")
-        
-            unique_phases=[]
+            # The window start is only needed for the P offset here
+            pdiff_time = UTCDateTime(event_info.get("start_time")) + arrivals[0].time + datetime.timedelta(seconds=self.clock_offset)
+            start_trim_time = pdiff_time - datetime.timedelta(seconds=event_info.get("window_in"))
+
+            p_time = arrivals[0].time - event_info.get("window_in")
+
+            unique_phases = []
             for arrival in arrivals:
                 if arrival.name not in unique_phases:
                     unique_phases.append(arrival.name)
-                    arrival.time=round(arrival.time, 3)
-                    arrival.time-=p_time-1
+                    arrival.time = round(arrival.time, 3)
+                    arrival.time -= p_time - 1
                     distance_km = tr.stats.distance / 1000
                     if arrival.name not in offset_traveltime_arrival:
                         offset_traveltime_arrival[arrival.name] = []
-                    offset_traveltime_arrival[arrival.name].append([distance_km,arrival.time])
-    
-        if ep.get("plot_section_colour"):
-            st_every_other.plot(fig=fig, type='section', norm_method="trace", time_down=True, orientation='vertical',linewidth=0.1,fillcolors=('blue','red'), scale=2.5, dpi=900)
+                    offset_traveltime_arrival[arrival.name].append([distance_km, arrival.time])
+        return offset_traveltime_arrival
+
+    def _draw_cable_section(self, fig, ax0, ax_side, st_every_other, event,
+                            offset_traveltime_arrival, time_delta, local):
+        """Plot the cable section on ``ax0`` and overlay the phase curves.
+
+        ``ax_side`` is the first side panel (or None); it shares ``ax0``'s time axis.
+        """
+        if self.exec_params.get("plot_section_colour"):
+            st_every_other.plot(fig=fig, type='section', norm_method="trace", time_down=True, orientation='vertical', linewidth=0.1, fillcolors=('blue', 'red'), scale=2.5, dpi=900)
         else:
-            st_every_other.plot(fig=fig, type='section', norm_method="trace", time_down=True, orientation='vertical',linewidth=0.1, scale=1.5, dpi=900)
-    
+            st_every_other.plot(fig=fig, type='section', norm_method="trace", time_down=True, orientation='vertical', linewidth=0.1, scale=1.5, dpi=900)
+
         ax0.set_title(f'{event} M{str(self.sources.get(event, {}).get("magnitude"))}')
-        ax3=ax0.twinx()
-        #ax3=ax0.twiny()
+        ax3 = ax0.twinx()
         ax3.sharey(ax0)
-        if len(st_event)>0:
-            ax1[0].sharey(ax0)
-            yticklabels = ax1[0].get_yticklabels()
+        if ax_side is not None:
+            ax_side.sharey(ax0)
+            yticklabels = ax_side.get_yticklabels()
             plt.setp(yticklabels, visible=False)
-        # ax3.invert_yaxis()
-        # ax3.set_ylim(time_delta-0.0001,0)
-        prev=0
-        annot=""
+        prev = 0
+        annot = ""
         label_space = 1 if local else 10
         logger.debug("%s %s %s", "LABEL SPACE:", local, label_space)
-    
+
         for name, data in offset_traveltime_arrival.items():
-            x=[point[0] for point in data]
-            y=[point[1] for point in data]
-            ax3.plot(x,y, linestyle='-',linewidth=.5, color='red')
-            annot=annot+" "+name
-            first_point=data[0]
-            if first_point[1] > prev+label_space and first_point[1] < time_delta:
-                ax3.annotate(annot,xy=(first_point[0],first_point[1]),textcoords="offset points",xytext=(-5,0),ha='center',fontsize=8)
-                annot=""
-            prev=first_point[1]
-        
+            x = [point[0] for point in data]
+            y = [point[1] for point in data]
+            ax3.plot(x, y, linestyle='-', linewidth=.5, color='red')
+            annot = annot + " " + name
+            first_point = data[0]
+            if first_point[1] > prev + label_space and first_point[1] < time_delta:
+                ax3.annotate(annot, xy=(first_point[0], first_point[1]), textcoords="offset points", xytext=(-5, 0), ha='center', fontsize=8)
+                annot = ""
+            prev = first_point[1]
+
+    @staticmethod
+    def _save_record_section(filename):
         plt.tight_layout()
-        plt.savefig(filename+'.eps',dpi=900, format='eps')
-        plt.savefig(filename+'.pdf',dpi=300, format='pdf')
-        #plt.savefig(filename+'.png',dpi=900, format='png')
-        # Add the existing figure as a subplot
+        plt.savefig(filename + '.eps', dpi=900, format='eps')
+        plt.savefig(filename + '.pdf', dpi=300, format='pdf')
         plt.show()
         plt.close()
-    
-        logger.debug(f'Interspace spacing={st_every_other[1].stats.distance-st_every_other[0].stats.distance} from {st_every_other[0].stats.distance} to {st_every_other[-1].stats.distance}. {len(st_every_other)} traces.')
-        logger.info("Finished plotting record section.")
